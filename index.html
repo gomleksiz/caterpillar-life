@@ -1,0 +1,1883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<link rel="icon" href="data:,">
+<title>Caterpillar Life</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0e12;overflow:hidden;touch-action:none}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{
+    image-rendering:pixelated;
+    image-rendering:-moz-crisp-edges;
+    image-rendering:crisp-edges;
+    display:block;
+    cursor:crosshair;
+    box-shadow:0 0 0 2px #1d242c, 0 12px 40px rgba(0,0,0,.6);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+/* ==========================================================================
+   CATERPILLAR LIFE
+   A single-file life-cycle game. Eat -> lay eggs -> pupate -> fly -> die ->
+   hatch again. The loop is the game; losing the eggs is the only real end.
+   ========================================================================== */
+
+/* ---------- config ------------------------------------------------------ */
+const VW = 480, VH = 270;           // internal pixel buffer
+const WORLD_W = 760;                // world is wider than the view
+const GROUND_Y = 226;               // top of the soil
+const DEBUG = /[?&]debug=1/.test(location.search);
+
+const CFG = {
+  grav:        620,
+  catSpeed:    64,
+  catJump:     198,
+  catHpMax:    4,
+  iframes:     1.0,
+  breathMax:   100,
+  breathDrain: 26,
+  breathFill:  22,
+  digTime:     0.18,
+
+  nibbleRate:  0.42,   // leaf fraction eaten per second while holding E
+  biteChunk:   0.34,   // leaf fraction eaten per click
+  leavesNeeded: 5,
+
+  layRate:     0.42,
+  layClick:    0.10,
+  crackRate:   0.26,
+  crackClick:  0.09,
+
+  flySpeed:    172,
+  flyAccel:    620,
+  flyDrag:     2.6,
+  flyGrav:     58,
+  clawCd:      0.30,
+  clawDmg:     3,
+  clawRange:   26,
+  poisonMax:   120,
+  poisonHit:   11,
+  poisonDecay: 1.6,
+
+  eggHpBase:   14,
+  chryHpBase:  12,
+  turretRange: 122,
+  turretRate:  1.4,
+  turretDmg:   1,
+  pelletSpeed: 235,
+};
+
+/* ---------- tiny helpers ------------------------------------------------ */
+const clamp = (v,a,b) => v < a ? a : v > b ? b : v;
+const lerp  = (a,b,t) => a + (b-a)*t;
+const rnd   = (a,b) => a + Math.random()*(b-a);
+const rndi  = (a,b) => Math.floor(rnd(a,b+1));
+const pick  = arr => arr[Math.floor(Math.random()*arr.length)];
+const sign  = v => v < 0 ? -1 : 1;
+const dist  = (ax,ay,bx,by) => Math.hypot(ax-bx, ay-by);
+const aabb  = (a,b) => a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+const ptIn  = (px,py,r) => px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h;
+
+/* ---------- pixel sprite baker ------------------------------------------
+   Sprites are arrays of strings, one character per pixel, looked up in a
+   shared palette. Short rows are padded with transparency, so the grids
+   below never need to be counted by hand.                                  */
+const PAL = {
+  '.': null,
+  'd': '#2f6b1f', 'G': '#5cbb3c', 'L': '#9ee86a', 'f': '#1e4413',
+  's': '#4f9c2e', 'S': '#7ed24d',
+  'k': '#14181e', 'W': '#ffffff', 'Y': '#f7c93f', 'y': '#fff0a8',
+  'p': '#8b4fc9', 'P': '#c294ee', 'o': '#f0913c', 'O': '#ffd07a',
+  'a': '#333a46', 'A': '#5b6474', 'n': '#c9d2de',
+  'r': '#a83a30', 'R': '#dd6a55',
+  'j': '#2f9e77', 'J': '#6fe3b4',
+  'e': '#efe6cf', 'E': '#fffdf2',
+  'm': '#6a4726', 'M': '#996c40',
+  'z': '#7ad13a', 'Z': '#c4f27a',
+};
+
+function spr(rows, pal){
+  pal = pal || PAL;
+  const w = Math.max.apply(null, rows.map(r => r.length));
+  const h = rows.length;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d');
+  const img = cx.createImageData(w, h);
+  for (let j = 0; j < h; j++){
+    const row = rows[j];
+    for (let i = 0; i < w; i++){
+      const col = pal[i < row.length ? row[i] : '.'];
+      if (!col) continue;
+      const o = (j*w + i) * 4;
+      img.data[o]   = parseInt(col.slice(1,3), 16);
+      img.data[o+1] = parseInt(col.slice(3,5), 16);
+      img.data[o+2] = parseInt(col.slice(5,7), 16);
+      img.data[o+3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  return cv;
+}
+
+function flipH(src){
+  const cv = document.createElement('canvas');
+  cv.width = src.width; cv.height = src.height;
+  const cx = cv.getContext('2d');
+  cx.imageSmoothingEnabled = false;
+  cx.translate(src.width, 0); cx.scale(-1, 1);
+  cx.drawImage(src, 0, 0);
+  return cv;
+}
+const pair = rows => { const a = spr(rows); return [a, flipH(a)]; };
+
+/* ---------- sprites ----------------------------------------------------- */
+const SPR = {};
+
+SPR.cat = [
+  pair([
+    '..dd...dd...ddd..',
+    '.dLLd.dLLd.dLLLd.',
+    'dLGGLddLGGLdLGGGd',
+    'dGGGGGGGGGGGGGGGd',
+    'dGGGGGGGGGGGGkWGd',
+    'dGdGGdGGdGGdGGGGd',
+    '.dddddddddddddddd',
+    '..ff..ff..ff..ff.',
+  ]),
+  pair([
+    '....dd...dd...dd.',
+    '...dLLd.dLLd.dLLd',
+    '.ddLGGLddLGGLdLGd',
+    'dGGGGGGGGGGGGGGGd',
+    'dGGGGGGGGGGGGkWGd',
+    'dGdGGdGGdGGdGGGGd',
+    '.dddddddddddddddd',
+    '.ff..ff..ff..ff..',
+  ]),
+];
+
+SPR.catBall = pair([          // curled up, used while digging / hurt
+  '..ddddd..',
+  '.dLGGGLd.',
+  'dGGdddGGd',
+  'dGdGGGdGd',
+  'dGdGGGdkd',
+  'dGGdddGGd',
+  '.dGGGGGd.',
+  '..ddddd..',
+]);
+
+SPR.mound = spr([             // dirt mound covering a burrowed caterpillar
+  '....mmmm....',
+  '..mmMMMMmm..',
+  '.mMMMmMMMMm.',
+  'mMMmMMMMmMMm',
+  'mmmmmmmmmmmm',
+]);
+
+SPR.bfly = [
+  pair([                      // wings up
+    '..pp.........pp..',
+    '.pPPp.......pPPp.',
+    'pPPPPp..kkk.pPPPp',
+    'pPoPPp.kWWk.pPoPp',
+    'pPPPPpYaAaYpPPPPp',
+    '.pPPPpYaAaYpPPPp.',
+    '..pPPp.aAa.pPPp..',
+    '...pPPpaAapPPp...',
+    '....pPpaAapPp....',
+    '.....ppaAapp.....',
+    '.......aAa.......',
+    '.......aaa.......',
+  ]),
+  pair([                      // wings down
+    '.................',
+    '..pp.........pp..',
+    '.pPPPp..kkk.pPPPp',
+    'pPoPPp.kWWk.pPoPp',
+    'pPPPPPYaAaYPPPPPp',
+    'pPPPPPYaAaYPPPPPp',
+    '.pPPPp.aAa.pPPPp.',
+    '..pPPp.aAa.pPPp..',
+    '...ppp.aAa.ppp...',
+    '.....p.aAa.p.....',
+    '.......aAa.......',
+    '.......aaa.......',
+  ]),
+];
+
+SPR.ant     = pair([
+  '..a....a.',
+  '...a..a..',
+  '.aAAaAAAa',
+  'aAAAAAAAk',
+  '.aAAaAAAa',
+  'a.a.a.a..',
+]);
+SPR.beetle  = pair([
+  '...rrrrr...',
+  '..rRRRRRr..',
+  '.rRRrrrRRr.',
+  'rRRRrkrRRRr',
+  'rRRRRrRRRRk',
+  '.rRRRRRRRr.',
+  '..rrrrrrr..',
+  'a.a.a.a.a.a',
+]);
+SPR.spitter = pair([
+  '.....zz....',
+  '....zZZz...',
+  '.zzzZZZZz..',
+  'zZZZZZZZzk.',
+  'zZZZZZZZzWk',
+  '.zZZZZZZz..',
+  '..zzzzzz...',
+  '.a.a.a.a...',
+]);
+SPR.flyer   = pair([
+  '.n.....n...',
+  'nnn...nnn..',
+  '.aaaaaaak..',
+  'aAAAAAAAAk.',
+  '.aaaaaaak..',
+  'nnn...nnn..',
+  '.n.....n...',
+]);
+
+SPR.leaf = pair([
+  '......ssss......',
+  '...sssSSSsss....',
+  '.ssSSSSSSSSSss..',
+  'sSSSSSdSSSSSSSs.',
+  'sSSSSdSSSSSSSSs.',
+  'sSSSdSSSSSSSSs..',
+  '.ssdSSSSSSSss...',
+  '..dsssssssss....',
+  '.dd.............',
+]);
+
+SPR.chry = spr([
+  '.....jjj.....',
+  '....jJJJj....',
+  '...jJJJJJj...',
+  '..jJJjjjJJj..',
+  '.jJJjYYYjJJj.',
+  '.jJJjYjYjJJj.',
+  'jJJjYYjYYjJJj',
+  'jJJjYjjjYjJJj',
+  'jJJjYYjYYjJJj',
+  'jJJjYjjjYjJJj',
+  'jJJjYYYYYjJJj',
+  'jJJjjYYYjjJJj',
+  'jJJJjjYjjJJJj',
+  '.jJJjjjjjJJj.',
+  '.jJJJjjjJJJj.',
+  '..jJJJJJJJj..',
+  '..jJJJJJJJj..',
+  '...jJJJJJj...',
+  '....jJJJj....',
+  '.....jJj.....',
+  '.....jjj.....',
+]);
+
+SPR.eggs = spr([
+  '...ee....ee.....',
+  '..eEEe..eEEe.ee.',
+  '.eEEEEeeEEEEeEEe',
+  '.eEEEEeeEEEEeEEe',
+  '..eEEe..eEEe.ee.',
+  '...ee....ee.....',
+]);
+
+SPR.turret = spr([
+  '..aaaaa..',
+  '.aAAAAAa.',
+  'aAAaaaAAa',
+  'aAAAAAAAa',
+  '.aAAAAAa.',
+  '..aaaaa..',
+  '...aaa...',
+]);
+
+SPR.log = spr([
+  '.mmmmmmmmmmmmmmmmmmmmmmmm.',
+  'mMMMMMMMMMMMMMMMMMMMMMMMMm',
+  'mMMmmmMMMMMMMMMMMMMMmmmMMm',
+  'mMMmkkmMMMMMMMMMMMMmkkmMMm',
+  'mMMmkkmMMMMMMMMMMMMmkkmMMm',
+  'mMMmmmMMMMMMMMMMMMMMmmmMMm',
+  'mMMMMMMMMMMMMMMMMMMMMMMMMm',
+  '.mmmmmmmmmmmmmmmmmmmmmmmm.',
+]);
+
+/* ---------- renderer ---------------------------------------------------- */
+const view = document.getElementById('c');
+const vctx = view.getContext('2d');
+const buf  = document.createElement('canvas');
+buf.width = VW; buf.height = VH;
+const ctx = buf.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+let scale = 1;
+
+function resize(){
+  scale = Math.max(1, Math.min(
+    Math.floor(window.innerWidth  / VW),
+    Math.floor(window.innerHeight / VH)
+  ));
+  view.width  = VW * scale;
+  view.height = VH * scale;
+  view.style.width  = (VW * scale) + 'px';
+  view.style.height = (VH * scale) + 'px';
+  vctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* draw a baked sprite, pixel-snapped, optionally clipped from the left edge */
+function blit(img, x, y, frac){
+  const w = frac === undefined ? img.width : Math.max(0, Math.round(img.width * frac));
+  if (w <= 0) return;
+  ctx.drawImage(img, 0, 0, w, img.height, Math.round(x), Math.round(y), w, img.height);
+}
+function px(x, y, w, h, col){
+  ctx.fillStyle = col;
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+function text(str, x, y, col, align){
+  ctx.font = '8px "Courier New",Courier,monospace';
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = col || '#ffffff';
+  ctx.fillText(str, Math.round(x), Math.round(y));
+  ctx.textAlign = 'left';
+}
+function shadowText(str, x, y, col, align){
+  text(str, x+1, y+1, 'rgba(0,0,0,.65)', align);
+  text(str, x, y, col, align);
+}
+
+/* ---------- input ------------------------------------------------------- */
+const keys = new Set();
+const tapped = new Set();          // edge-triggered this frame
+const mouse = { x: 0, y: 0, down: false, clicks: 0, held: false };
+
+function keyName(e){
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  return k;
+}
+window.addEventListener('keydown', e => {
+  const k = keyName(e);
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].indexOf(e.key) >= 0) e.preventDefault();
+  if (!keys.has(k)) tapped.add(k);
+  keys.add(k);
+});
+window.addEventListener('keyup', e => keys.delete(keyName(e)));
+window.addEventListener('blur', () => keys.clear());
+
+const held = k => keys.has(k);
+const hit  = k => tapped.has(k);
+const heldAny = list => list.some(held);
+const hitAny  = list => list.some(hit);
+
+function toBuffer(ev){
+  const r = view.getBoundingClientRect();
+  return {
+    x: (ev.clientX - r.left) / scale,
+    y: (ev.clientY - r.top)  / scale,
+  };
+}
+view.addEventListener('pointermove', ev => { const p = toBuffer(ev); mouse.x = p.x; mouse.y = p.y; });
+view.addEventListener('pointerdown', ev => {
+  const p = toBuffer(ev);
+  mouse.x = p.x; mouse.y = p.y; mouse.down = true; mouse.held = true; mouse.clicks++;
+  view.setPointerCapture && view.setPointerCapture(ev.pointerId);
+  ev.preventDefault();
+});
+window.addEventListener('pointerup', () => { mouse.held = false; });
+view.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------- audio (tiny blip synth) ------------------------------------- */
+let actx = null, muted = false;
+function beep(freq, dur, type, gain){
+  if (muted) return;
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, actx.currentTime);
+    g.gain.setValueAtTime((gain === undefined ? 0.05 : gain), actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (err) { /* audio is a nicety, never a blocker */ }
+}
+const SFX = {
+  bite:  () => beep(rnd(280,340), 0.06, 'square', 0.04),
+  chomp: () => beep(rnd(160,200), 0.12, 'sawtooth', 0.05),
+  jump:  () => beep(420, 0.08, 'square', 0.035),
+  dig:   () => beep(90, 0.16, 'sawtooth', 0.045),
+  hurt:  () => beep(120, 0.22, 'sawtooth', 0.07),
+  shoot: () => beep(660, 0.05, 'square', 0.03),
+  kill:  () => beep(rnd(200,260), 0.14, 'square', 0.05),
+  claw:  () => beep(520, 0.07, 'sawtooth', 0.05),
+  buy:   () => beep(780, 0.1, 'triangle', 0.06),
+  lay:   () => beep(rnd(500,620), 0.09, 'triangle', 0.05),
+  born:  () => { beep(440,0.12,'triangle',0.06); setTimeout(()=>beep(660,0.16,'triangle',0.06),120); },
+  die:   () => { beep(220,0.3,'sawtooth',0.07); setTimeout(()=>beep(140,0.45,'sawtooth',0.07),160); },
+};
+
+/* ---------- world ------------------------------------------------------- */
+const clickQ = [];
+view.addEventListener('pointerdown', ev => { const p = toBuffer(ev); clickQ.push(p); });
+
+let leaves = [], stems = [], bugs = [], shots = [], parts = [], turrets = [], floats = [];
+let player = null, eggs = null, chry = null;
+const cam = { x: 0 };
+const log  = { x: 398, y: GROUND_Y - 16, w: 52, h: 16 };
+const nest = { x: log.x + 12, y: GROUND_Y - 12, w: 28, h: 12 };
+const branch = { x: nest.x + nest.w/2, y: GROUND_Y - 104 };
+
+const state = {
+  stage: 'title', t: 0, stageT: 0,
+  gen: 1, leafPoints: 0, bugsKilled: 0, leavesEaten: 0,
+  fullness: 0, poison: 0,
+  wave: 0, wavesTotal: 3, spawnLeft: 0, spawnCd: 0,
+  up: { turrets: 1, rate: 0, dmg: 0, shell: 0, egg: 0 },
+  paused: false, hover: null, clickables: [],
+  best: parseInt(localStorage.getItem('cl_best') || '0', 10) || 0,
+  shake: 0, flash: 0, msg: '', msgT: 0,
+};
+
+const diff = () => 1 + (state.gen - 1) * 0.2;
+
+function buildGarden(){
+  leaves = []; stems = [];
+  const xs = [56, 132, 208, 286, 366, 470, 528, 600];
+  xs.forEach((x, i) => {
+    const h = 40 + ((i * 29) % 92);
+    stems.push({ x: x - 2, y: GROUND_Y - h, w: 4, h: h, sway: rnd(0, 6.28) });
+    for (let k = 0; ; k++){
+      const ly = GROUND_Y - 26 - k * 22;
+      if (ly < GROUND_Y - h) break;
+      const right = ((k + i) % 2) === 0;
+      leaves.push({
+        x: right ? x + 1 : x - 17, y: ly, w: 16, h: 5,
+        amount: 1, flip: !right, bob: rnd(0, 6.28),
+      });
+    }
+  });
+}
+
+function say(msg, secs){ state.msg = msg; state.msgT = secs || 3; }
+
+function burst(x, y, col, n, spd, life){
+  for (let i = 0; i < n; i++){
+    const a = rnd(0, Math.PI * 2), s = rnd(0.3, 1) * (spd || 60);
+    parts.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s - 20,
+                 life: life || rnd(0.3, 0.7), t: 0, col, g: 180, sz: rndi(1,2) });
+  }
+}
+function floatText(x, y, str, col){ floats.push({ x, y, str, col, t: 0 }); }
+
+/* ---------- entities ---------------------------------------------------- */
+const BUG_BASE = {
+  ant:     { w: 9,  h: 6, hp: 2, speed: 46, dmg: 1, chew: 1.2, score: 1 },
+  beetle:  { w: 11, h: 8, hp: 5, speed: 30, dmg: 1, chew: 2.0, score: 2 },
+  spitter: { w: 11, h: 8, hp: 3, speed: 27, dmg: 1, chew: 1.0, score: 3 },
+  flyer:   { w: 11, h: 7, hp: 2, speed: 58, dmg: 1, chew: 1.2, score: 2 },
+};
+
+function spawnBug(type, x, y){
+  const b0 = BUG_BASE[type];
+  const hp = Math.max(1, Math.round(b0.hp * (1 + (state.gen - 1) * 0.28)));
+  const b = {
+    type, x, y: y === undefined ? GROUND_Y - b0.h : y,
+    w: b0.w, h: b0.h, vx: 0, vy: 0,
+    hp, maxHp: hp, dmg: b0.dmg, chew: b0.chew, score: b0.score,
+    speed: b0.speed * (1 + (state.gen - 1) * 0.07),
+    flying: type === 'flyer',
+    face: -1, onGround: false, stun: 0, windup: 0, lunge: 0,
+    flash: 0, retreat: 0, shootCd: rnd(0.6, 2.2), wander: rnd(-1, 1), wanderT: 0, anim: rnd(0, 9),
+  };
+  bugs.push(b);
+  return b;
+}
+
+function bugTypesFor(stage){
+  const g = state.gen;
+  if (stage === 'larva') return g >= 3 ? ['ant','ant','beetle','beetle'] : ['ant','ant','ant','beetle'];
+  const pool = ['ant','ant','beetle','spitter'];
+  if (g >= 2) pool.push('spitter','flyer');
+  if (g >= 3) pool.push('flyer','beetle');
+  return pool;
+}
+
+function spawnEdgeBug(){
+  const type = pick(bugTypesFor(state.stage));
+  /* just outside the view, so a wave arrives in seconds rather than a minute */
+  const left = Math.random() < 0.5;
+  const x = clamp((left ? cam.x - 16 : cam.x + VW + 6) + rnd(-14, 14), -20, WORLD_W + 16);
+  const b = spawnBug(type, x, type === 'flyer' ? rnd(70, GROUND_Y - 40) : undefined);
+  b.face = left ? 1 : -1;
+  return b;
+}
+
+function damageBug(b, dmg, kx){
+  b.hp -= dmg;
+  b.flash = 0.12;
+  b.vx += (kx || 0);
+  if (b.hp <= 0){
+    b.dead = true;
+    state.bugsKilled++;
+    burst(b.x + b.w/2, b.y + b.h/2, '#8a5230', 9, 90);
+    burst(b.x + b.w/2, b.y + b.h/2, '#dd6a55', 5, 70);
+    SFX.kill();
+  } else {
+    burst(b.x + b.w/2, b.y + b.h/2, '#dd6a55', 3, 50, 0.25);
+  }
+}
+
+/* solids: only the soil. Leaves are one-way platforms, stems are scenery. */
+function moveEntity(e, dt, oneWay){
+  e.x += e.vx * dt;
+  e.x = clamp(e.x, -20, WORLD_W - e.w + 20);
+  const prevBottom = e.y + e.h;
+  e.y += e.vy * dt;
+  e.onGround = false;
+  if (e.y + e.h >= GROUND_Y){ e.y = GROUND_Y - e.h; e.vy = 0; e.onGround = true; }
+  if (oneWay && e.vy > 0){
+    for (const l of leaves){
+      if (l.amount <= 0.15) continue;
+      const pw = l.w * l.amount;
+      const plx = l.flip ? l.x + l.w - pw : l.x;
+      if (e.x + e.w > plx && e.x < plx + pw && prevBottom <= l.y + 2 && e.y + e.h >= l.y){
+        e.y = l.y - e.h; e.vy = 0; e.onGround = true; e.standing = l;
+      }
+    }
+  }
+}
+
+/* ---------- stage machine ----------------------------------------------- */
+function setStage(name){
+  state.stage = name;
+  state.stageT = 0;
+  if (name === 'larva') enterLarva();
+  if (name === 'nesting') enterNesting();
+  if (name === 'upgrading') enterUpgrading();
+  if (name === 'chrysalis') enterWave();
+  if (name === 'butterfly') enterButterfly();
+}
+
+function makeCaterpillar(x, y){
+  return {
+    kind: 'cat', x, y, w: 15, h: 8, vx: 0, vy: 0, face: 1,
+    onGround: false, hp: CFG.catHpMax, inv: 0, anim: 0,
+    burrow: 0,            // 0 = above ground, 1 = fully hidden
+    digging: false, breath: CFG.breathMax,
+    moveTarget: null, eating: null, hurtT: 0,
+  };
+}
+
+function enterLarva(){
+  const sx = eggs ? eggs.x : 96;
+  buildGarden();
+  bugs = []; shots = []; turrets = [];
+  eggs = null; chry = null;
+  state.fullness = 0; state.poison = 0;
+  player = makeCaterpillar(clamp(sx, 12, WORLD_W - 30), GROUND_Y - 8);
+  player.inv = 1.6;                       // a moment to get your bearings
+  const n = 1 + Math.min(4, state.gen);
+  for (let i = 0; i < n; i++){
+    const t = pick(bugTypesFor('larva'));
+    spawnBug(t, rnd(60, WORLD_W - 120));
+  }
+  say('EAT ' + CFG.leavesNeeded + ' LEAVES  -  hold E or click a leaf', 5);
+}
+
+function enterNesting(){
+  say('FULL!  Find the log and lay your eggs', 4);
+}
+
+function layEggs(){
+  const maxHp = CFG.eggHpBase + 7 * state.up.egg;
+  eggs = { x: nest.x + 5, y: nest.y - 2, w: 16, h: 6, hp: maxHp, maxHp, glow: 0 };
+  SFX.lay();
+  burst(eggs.x + 8, eggs.y + 3, '#fffdf2', 16, 70);
+  say('Eggs laid. Now pupate above them.', 3.5);
+}
+
+function enterChrysalisStage(){
+  const maxHp = Math.round((CFG.chryHpBase + 6 * state.up.shell) * (1 + (state.gen-1) * 0.1));
+  chry = { x: branch.x - 6, y: branch.y, w: 13, h: 21, hp: maxHp, maxHp,
+           crack: 0, cracking: false, wobble: 0 };
+  player = null;
+  turrets = [];
+  state.wavesTotal = 3 + Math.min(3, state.gen - 1);
+  state.wave = 0;
+  rebuildTurrets();
+  setStage('upgrading');
+}
+
+/* absolute mounts: the first gun guards the clutch, the other two ride the branch */
+function mountAt(i){
+  if (i === 0) return { x: log.x + 3,       y: log.y - 7 };
+  if (i === 1) return { x: branch.x - 48,   y: branch.y - 13 };
+  return              { x: branch.x + 39,   y: branch.y - 13 };
+}
+function rebuildTurrets(){
+  turrets = [];
+  for (let i = 0; i < state.up.turrets; i++){
+    const m = mountAt(i);
+    turrets.push({ x: m.x, y: m.y, w: 9, h: 7, cd: 0, aim: -Math.PI/2, flash: 0 });
+  }
+}
+
+function enterUpgrading(){
+  bugs = []; shots = [];
+  if (state.wave >= state.wavesTotal){ chry.cracking = true; setStage('chrysalis'); return; }
+}
+
+function enterWave(){
+  state.wave++;
+  state.spawnLeft = chry && chry.cracking ? 0 : 3 + state.wave + Math.floor(state.gen * 0.9);
+  state.waveT = 0;
+  state.spawnCd = 0.4;
+  if (!chry.cracking) say('WAVE ' + state.wave + ' / ' + state.wavesTotal, 2.2);
+}
+
+function enterButterfly(){
+  const cx = chry ? chry.x + chry.w/2 : branch.x;
+  const cy = chry ? chry.y : branch.y;
+  player = {
+    kind: 'bfly', x: cx - 8, y: cy, w: 17, h: 12, vx: 0, vy: 0, face: 1,
+    anim: 0, claw: 0, clawCd: 0, hurtT: 0, inv: 0,
+  };
+  /* the guns came down with the shell - from here the claws are the defense */
+  for (const t of turrets) burst(t.x + 4, t.y + 3, '#5b6474', 7, 70, 0.5);
+  turrets = [];
+  chry = null;
+  state.poison = 0;
+  bugs = []; shots = [];
+  state.spawnCd = 1.2;
+  SFX.born();
+  say('BUTTERFLY!  SPACE to claw. Guard the eggs.', 4);
+}
+
+function hatchNext(){
+  state.gen++;
+  state.leafPoints = Math.floor(state.leafPoints * 0.5);
+  if (state.gen - 1 > state.best){
+    state.best = state.gen - 1;
+    localStorage.setItem('cl_best', String(state.best));
+  }
+  eggs = null; chry = null;
+  setStage('larva');
+  SFX.born();
+}
+
+function gameOver(title, sub){
+  state.stage = 'gameover';
+  state.stageT = 0;
+  state.overTitle = title || 'THE CLUTCH IS GONE';
+  state.overSub   = sub   || 'Nothing was left to hatch.';
+  player = null; chry = null;
+  SFX.die();
+}
+
+function resetRun(){
+  state.gen = 1; state.leafPoints = 0; state.bugsKilled = 0; state.leavesEaten = 0;
+  state.up = { turrets: 1, rate: 0, dmg: 0, shell: 0, egg: 0 };
+  parts = []; floats = []; shots = []; bugs = [];
+  eggs = null; chry = null;
+  setStage('larva');
+}
+
+/* ---------- clickable targets ------------------------------------------- */
+const PANEL = { x: 96, y: 44, w: 288, h: 178 };
+const UPGRADES = [
+  { id: 'turrets', name: 'BUY GUN',       max: 3, cost: l => 30 + 28 * (l - 1), note: 'another turret' },
+  { id: 'rate',    name: 'FIRE RATE +',   max: 6, cost: l => 18 + 12 * l,       note: 'guns shoot faster' },
+  { id: 'dmg',     name: 'DAMAGE +',      max: 6, cost: l => 24 + 16 * l,       note: 'guns hit harder' },
+  { id: 'shell',   name: 'SHELL ARMOR +', max: 6, cost: l => 16 + 11 * l,       note: 'chrysalis hp' },
+  { id: 'egg',     name: 'EGG ARMOR +',   max: 6, cost: l => 16 + 11 * l,       note: 'egg hp' },
+];
+function upLevel(u){ return u.id === 'turrets' ? state.up.turrets : state.up[u.id]; }
+function upCost(u){ return u.cost(upLevel(u)); }
+function upMaxed(u){ return upLevel(u) >= u.max; }
+
+function worldMouse(){ return { x: mouse.x + cam.x, y: mouse.y }; }
+
+function buildClickables(){
+  const cl = [];
+  const st = state.stage;
+  if (st === 'larva' || st === 'nesting'){
+    for (const l of leaves){
+      if (l.amount <= 0.06) continue;
+      cl.push({ x: l.x - 2, y: l.y - 4, w: l.w + 4, h: l.h + 9, kind: 'leaf', ref: l });
+    }
+    cl.push({ x: 0, y: GROUND_Y, w: WORLD_W, h: VH - GROUND_Y, kind: 'soil' });
+    if (st === 'nesting') cl.push({ x: nest.x - 4, y: nest.y - 10, w: nest.w + 8, h: nest.h + 12, kind: 'nest' });
+  }
+  if (st === 'chrysalis' && chry && chry.cracking){
+    cl.push({ x: chry.x - 5, y: chry.y - 5, w: chry.w + 10, h: chry.h + 10, kind: 'chry' });
+  }
+  if (st === 'upgrading'){
+    UPGRADES.forEach((u, i) => {
+      cl.push({ x: PANEL.x + 12, y: PANEL.y + 34 + i * 20, w: PANEL.w - 24, h: 17,
+                kind: 'upgrade', ref: u, screen: true });
+    });
+    cl.push({ x: PANEL.x + 72, y: PANEL.y + PANEL.h - 26, w: 144, h: 18, kind: 'startwave', screen: true });
+  }
+  if (st === 'title')    cl.push({ x: 0, y: 0, w: VW, h: VH, kind: 'start', screen: true });
+  if (st === 'gameover') cl.push({ x: VW/2 - 60, y: 186, w: 120, h: 18, kind: 'restart', screen: true });
+  state.clickables = cl;
+}
+
+function findTarget(sx, sy){
+  const wx = sx + cam.x;
+  for (const c of state.clickables){
+    if (c.screen ? ptIn(sx, sy, c) : ptIn(wx, sy, c)) return c;
+  }
+  return null;
+}
+
+/* ---------- shared bits ------------------------------------------------- */
+function catHidden(){ return !!player && player.kind === 'cat' && player.burrow > 0.5; }
+function catSafe(){ return !!player && player.kind === 'cat' && player.burrow > 0.15; }
+function diggable(x){ return !(x + 8 > log.x - 4 && x < log.x + log.w + 4); }
+
+function nearestLeaf(p){
+  let best = null, bd = 1e9;
+  const cx = p.x + p.w/2, cy = p.y + p.h/2;
+  for (const l of leaves){
+    if (l.amount <= 0.06) continue;
+    const d = dist(cx, cy, l.x + l.w/2, l.y + l.h/2);
+    if (d < 20 && d < bd){ bd = d; best = l; }
+  }
+  return best;
+}
+
+function eatLeaf(l, amount){
+  const took = Math.min(amount, l.amount);
+  if (took <= 0) return;
+  l.amount -= took;
+  state.fullness = clamp(state.fullness + took / CFG.leavesNeeded, 0, 1);
+  state.leafPoints += took * 13;
+  l.munch = 0.12;
+  if (Math.random() < 0.4) burst(l.x + l.w*l.amount, l.y + 3, '#7ed24d', 1, 40, 0.3);
+  if (l.amount <= 0.07){
+    /* finish the stub in the same bite, or it lingers forever below the reach threshold */
+    state.fullness = clamp(state.fullness + l.amount / CFG.leavesNeeded, 0, 1);
+    state.leafPoints += l.amount * 13;
+    l.amount = 0;
+    state.leavesEaten++;
+    floatText(l.x + 8, l.y - 4, '+13', '#f7c93f');
+    /* a finished leaf is also a meal - it puts a heart back */
+    if (player && player.kind === 'cat' && player.hp < CFG.catHpMax){
+      player.hp++;
+      floatText(l.x + 8, l.y - 14, '+1 HP', '#dd6a55');
+      beep(700, 0.09, 'triangle', 0.05);
+    }
+    burst(l.x + 8, l.y + 3, '#5cbb3c', 8, 70);
+    SFX.chomp();
+  }
+}
+
+function hurtPlayer(dmg, fromX){
+  const p = player;
+  if (!p || p.inv > 0) return;
+  p.inv = CFG.iframes;
+  p.hurtT = 0.4;
+  state.shake = 5;
+  SFX.hurt();
+  if (p.kind === 'cat'){
+    p.hp -= dmg;
+    p.vx = sign(p.x + p.w/2 - fromX) * 165;
+    p.vy = -110;
+    burst(p.x + p.w/2, p.y + 4, '#dd6a55', 8, 80);
+    if (p.hp <= 0){
+      /* a larva has no clutch behind it yet - being eaten ends the line */
+      burst(p.x + p.w/2, p.y + 4, '#5cbb3c', 20, 120);
+      if (eggs){ player = null; state.stage = 'rebirth'; state.stageT = 0; }
+      else gameOver('THE CATERPILLAR WAS EATEN', 'It never got to lay a single egg.');
+    }
+  }
+}
+
+function spit(b, target){
+  const sx = b.x + b.w/2, sy = b.y + 2;
+  const ang = Math.atan2(target.y - sy, target.x - sx) - 0.25;
+  const sp = 130;
+  shots.push({ x: sx, y: sy, vx: Math.cos(ang)*sp, vy: Math.sin(ang)*sp,
+               dmg: 1, poison: true, life: 3, g: 110 });
+  beep(200, 0.08, 'sawtooth', 0.035);
+}
+
+/* ---------- bugs -------------------------------------------------------- */
+function bugGoal(b){
+  const st = state.stage;
+  if (st === 'larva' || st === 'nesting'){
+    if (player && !catHidden()){
+      b.lastSeen = player.x + player.w/2;
+      return { x: player.x + player.w/2, y: player.y + player.h/2, kind: 'player', ref: player };
+    }
+    /* it went underground - wander off away from where it vanished */
+    if (!(b.lostT > 0)){
+      b.lostT = rnd(1.6, 2.6);
+      b.lostDir = sign((b.x + b.w/2) - (b.lastSeen === undefined ? b.x : b.lastSeen)) || pick([-1, 1]);
+    }
+    return null;
+  }
+  const c = chry ? { x: chry.x + chry.w/2, y: chry.y + chry.h/2, kind: 'chry', ref: chry } : null;
+  const e = eggs ? { x: eggs.x + eggs.w/2, y: eggs.y + eggs.h/2, kind: 'eggs', ref: eggs } : null;
+  if (c && e) return dist(b.x, b.y, c.x, c.y) < dist(b.x, b.y, e.x, e.y) ? c : e;
+  return c || e;
+}
+
+function updateBugs(dt){
+  const d = diff();
+  for (const b of bugs){
+    if (b.dead) continue;
+    b.flash = Math.max(0, b.flash - dt);
+    b.anim += dt * 9;
+
+    if (b.stun > 0){
+      b.stun -= dt;
+      b.vx *= 0.86;
+      if (!b.flying) b.vy += CFG.grav * dt;
+      moveEntity(b, dt, false);
+      continue;
+    }
+
+    if (b.retreat > 0){
+      b.retreat -= dt;
+      const g0 = bugGoal(b);
+      const away = g0 ? -sign(g0.x - (b.x + b.w/2)) : b.face;
+      b.vx = lerp(b.vx, away * b.speed * 1.3, 0.15);
+      if (!b.flying) b.vy += CFG.grav * dt;
+      moveEntity(b, dt, false);
+      continue;
+    }
+
+    const goal = bugGoal(b);
+    b.shootCd -= dt;
+
+    /* spitters keep their distance and lob poison */
+    if (b.type === 'spitter' && !b.rush){
+      const st = (state.stage === 'butterfly' && player)
+        ? { x: player.x + player.w/2, y: player.y + player.h/2 } : goal;
+      if (st){
+        const dd = dist(b.x + b.w/2, b.y + b.h/2, st.x, st.y);
+        if (dd < 118){
+          if (b.shootCd <= 0){ b.shootCd = rnd(1.5, 2.6) / d; spit(b, st); }
+          b.face = sign(st.x - (b.x + b.w/2)) || b.face;
+          /* hold a firing band - close enough that the guns can answer back */
+          if (dd < 70)       b.vx = lerp(b.vx, -b.face * b.speed, 0.12);
+          else if (dd > 100) b.vx = lerp(b.vx,  b.face * b.speed, 0.12);
+          else               b.vx = lerp(b.vx, 0, 0.18);
+          b.vy += CFG.grav * dt;
+          moveEntity(b, dt, false);
+          continue;
+        }
+      }
+    }
+
+    if (!goal && b.lostT > 0){
+      b.lostT -= dt;
+      b.face = b.lostDir;
+      b.vx = lerp(b.vx, b.lostDir * b.speed * 0.85, 0.1);
+      if (b.flying) b.vy = lerp(b.vy, Math.sin(state.t + b.anim) * 16, 0.1);
+      else b.vy += CFG.grav * dt;
+      moveEntity(b, dt, false);
+      continue;
+    }
+    if (!goal){
+      b.wanderT -= dt;
+      if (b.wanderT <= 0){ b.wanderT = rnd(0.8, 2.2); b.wander = pick([-1, 0, 1]); }
+      b.vx = lerp(b.vx, b.wander * b.speed * 0.5, 0.12);
+      if (b.wander) b.face = sign(b.wander);
+      if (b.flying){ b.vy = lerp(b.vy, Math.sin(state.t + b.anim) * 18, 0.1); }
+      else b.vy += CFG.grav * dt;
+      moveEntity(b, dt, false);
+      continue;
+    }
+
+    const cx = b.x + b.w/2, cy = b.y + b.h/2;
+    b.face = sign(goal.x - cx) || b.face;
+
+    if (b.flying){
+      const a = Math.atan2(goal.y - cy, goal.x - cx);
+      b.vx = lerp(b.vx, Math.cos(a) * b.speed, 0.06);
+      b.vy = lerp(b.vy, Math.sin(a) * b.speed + Math.sin(state.t*3 + b.anim) * 14, 0.06);
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      b.y = clamp(b.y, 10, GROUND_Y - b.h);
+    } else {
+      /* a bug hunting the caterpillar moves slower than it does - the danger is
+         being cornered or careless, not being outrun */
+      const chase = goal.kind === 'player' ? 0.66 : 1;
+      if (b.windup > 0){
+        b.windup -= dt;
+        b.vx = lerp(b.vx, 0, 0.4);
+        if (b.windup <= 0){ b.lunge = 0.34; b.vx = b.face * b.speed * chase * 3.4; }
+      } else if (b.lunge > 0){
+        b.lunge -= dt;
+      } else {
+        const near = goal.kind === 'player' && Math.abs(goal.x - cx) < 20 && Math.abs(goal.y - cy) < 16;
+        if (near) { b.windup = 0.42; beep(300, 0.05, 'triangle', 0.02); }
+        else b.vx = lerp(b.vx, b.face * b.speed * chase, 0.1);
+      }
+      b.vy += CFG.grav * dt;
+      moveEntity(b, dt, false);
+    }
+
+    /* chewing on the clutch or the chrysalis */
+    if (goal.ref && (goal.kind === 'eggs' || goal.kind === 'chry')){
+      if (aabb(b, goal.ref)){
+        goal.ref.hp -= b.chew * d * dt;
+        goal.ref.hurt = 0.15;
+        b.vx *= 0.4;
+        if (Math.random() < dt * 6) burst(cx, cy, '#efe6cf', 2, 40, 0.3);
+      }
+    }
+  }
+  bugs = bugs.filter(b => !b.dead && b.x > -80 && b.x < WORLD_W + 80);
+}
+
+/* ---------- projectiles, particles -------------------------------------- */
+function updateShots(dt){
+  for (const s of shots){
+    s.life -= dt;
+    if (s.g) s.vy += s.g * dt;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    if (s.life <= 0 || s.y > VH + 10 || s.x < -30 || s.x > WORLD_W + 30){ s.dead = true; continue; }
+    if (s.friendly){
+      for (const b of bugs){
+        if (b.dead) continue;
+        if (s.x > b.x && s.x < b.x + b.w && s.y > b.y && s.y < b.y + b.h){
+          damageBug(b, s.dmg, s.vx * 0.06);
+          s.dead = true; break;
+        }
+      }
+    } else {
+      if (player && player.kind === 'bfly' && s.x > player.x && s.x < player.x + player.w &&
+          s.y > player.y && s.y < player.y + player.h){
+        state.poison = clamp(state.poison + CFG.poisonHit, 0, CFG.poisonMax);
+        player.hurtT = 0.3; state.shake = 3;
+        burst(s.x, s.y, '#7ad13a', 7, 60);
+        beep(150, 0.16, 'sawtooth', 0.05);
+        s.dead = true; continue;
+      }
+      if (player && player.kind === 'cat' && !catHidden() && s.x > player.x && s.x < player.x + player.w &&
+          s.y > player.y && s.y < player.y + player.h){
+        hurtPlayer(1, s.x); s.dead = true; continue;
+      }
+      for (const t of [chry, eggs]){
+        if (!t) continue;
+        if (s.x > t.x && s.x < t.x + t.w && s.y > t.y && s.y < t.y + t.h){
+          t.hp -= s.dmg; t.hurt = 0.15;
+          burst(s.x, s.y, '#7ad13a', 6, 50);
+          s.dead = true; break;
+        }
+      }
+      if (!s.dead && s.y + 2 >= GROUND_Y){ burst(s.x, GROUND_Y, '#7ad13a', 4, 40); s.dead = true; }
+    }
+  }
+  shots = shots.filter(s => !s.dead);
+}
+
+function updateParts(dt){
+  for (const p of parts){
+    p.t += dt;
+    p.vy += (p.g || 160) * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  parts = parts.filter(p => p.t < p.life);
+  for (const f of floats){ f.t += dt; f.y -= 18 * dt; }
+  floats = floats.filter(f => f.t < 1.1);
+}
+
+function updateTurrets(dt){
+  const rate = CFG.turretRate * (1 + 0.30 * state.up.rate);
+  const dmg  = CFG.turretDmg + state.up.dmg;
+  for (const t of turrets){
+    t.cd -= dt;
+    t.flash = Math.max(0, t.flash - dt);
+    let best = null, bd = 1e9;
+    for (const b of bugs){
+      if (b.dead) continue;
+      const d = dist(t.x + 4, t.y + 3, b.x + b.w/2, b.y + b.h/2);
+      if (d < bd && d < CFG.turretRange){ bd = d; best = b; }
+    }
+    if (best){
+      const ang = Math.atan2(best.y + best.h/2 - (t.y + 3), best.x + best.w/2 - (t.x + 4));
+      t.aim = ang;
+      if (t.cd <= 0){
+        t.cd = 1 / rate; t.flash = 0.09; SFX.shoot();
+        shots.push({ x: t.x + 4 + Math.cos(ang)*6, y: t.y + 3 + Math.sin(ang)*6,
+                     vx: Math.cos(ang)*CFG.pelletSpeed, vy: Math.sin(ang)*CFG.pelletSpeed,
+                     dmg, friendly: true, life: 1.5 });
+      }
+    } else {
+      t.aim = lerp(t.aim, -Math.PI/2, 1 - Math.pow(0.02, dt));
+    }
+  }
+}
+
+/* ---------- clicks ------------------------------------------------------ */
+function handleClicks(){
+  while (clickQ.length){
+    const c = clickQ.shift();
+    const t = findTarget(c.x, c.y);
+    const wx = c.x + cam.x, wy = c.y;
+    const st = state.stage;
+
+    if (st === 'title'){ resetRun(); continue; }
+    if (st === 'gameover'){ if (!t || t.kind === 'restart') resetRun(); continue; }
+    if (state.paused) continue;
+
+    if (st === 'upgrading'){
+      if (t && t.kind === 'upgrade') buyUpgrade(t.ref);
+      else if (t && t.kind === 'startwave') setStage('chrysalis');
+      continue;
+    }
+    if (st === 'chrysalis' && chry && chry.cracking){
+      chry.crack = clamp(chry.crack + CFG.crackClick, 0, 1);
+      burst(chry.x + 5, chry.y + 7, '#6fe3b4', 4, 60, 0.3);
+      beep(rnd(500, 700), 0.05, 'square', 0.04);
+      continue;
+    }
+    if (st === 'butterfly' && player){
+      clawAt(Math.atan2(wy - (player.y + player.h/2), wx - (player.x + player.w/2)));
+      continue;
+    }
+    if ((st === 'larva' || st === 'nesting') && player){
+      const p = player;
+      if (t && t.kind === 'leaf'){
+        const l = t.ref;
+        if (nearestLeaf(p) === l || dist(p.x+p.w/2, p.y+p.h/2, l.x+l.w/2, l.y+l.h/2) < 22){
+          if (!catHidden()){
+            eatLeaf(l, CFG.biteChunk);
+            SFX.bite();
+            burst(l.x + l.w*l.amount, l.y + 3, '#9ee86a', 3, 55, 0.3);
+          }
+        } else {
+          p.moveTarget = l.x + l.w/2; p.eatTarget = l; p.digWish = false;
+        }
+        continue;
+      }
+      if (t && t.kind === 'nest' && st === 'nesting'){
+        if (aabb({ x: p.x-6, y: p.y-6, w: p.w+12, h: p.h+12 }, nest)){
+          state.lay = clamp((state.lay || 0) + CFG.layClick, 0, 1);
+          burst(nest.x + 14, nest.y + 4, '#fffdf2', 3, 45, 0.3);
+          SFX.lay();
+        } else { p.moveTarget = nest.x + nest.w/2; p.eatTarget = null; p.digWish = false; }
+        continue;
+      }
+      if (t && t.kind === 'soil'){
+        if (Math.abs(wx - (p.x + p.w/2)) < 14){ p.digWish = !p.digWish; p.moveTarget = null; }
+        else { p.moveTarget = clamp(wx, 4, WORLD_W - 4); p.eatTarget = null; p.digWish = false; }
+        continue;
+      }
+      p.moveTarget = clamp(wx, 4, WORLD_W - 4); p.eatTarget = null; p.digWish = false;
+    }
+  }
+}
+
+function buyUpgrade(u){
+  if (upMaxed(u)) { beep(120, 0.08, 'square', 0.03); return; }
+  const cost = upCost(u);
+  if (state.leafPoints < cost){ beep(120, 0.1, 'square', 0.03); say('NOT ENOUGH LEAF POINTS', 1.6); return; }
+  state.leafPoints -= cost;
+  if (u.id === 'turrets'){ state.up.turrets++; rebuildTurrets(); }
+  else state.up[u.id]++;
+  if (u.id === 'shell' && chry){ chry.maxHp += 6; chry.hp += 6; }
+  if (u.id === 'egg' && eggs){ eggs.maxHp += 7; eggs.hp += 7; }
+  SFX.buy();
+}
+
+/* ---------- caterpillar ------------------------------------------------- */
+function updateCat(dt){
+  const p = player;
+  p.inv = Math.max(0, p.inv - dt);
+  p.hurtT = Math.max(0, p.hurtT - dt);
+
+  const kl = heldAny(['ArrowLeft','a']), kr = heldAny(['ArrowRight','d']);
+  const kdig = heldAny(['ArrowDown','s']);
+  if (kl || kr) { p.moveTarget = null; p.eatTarget = null; }
+  if (hitAny(['ArrowUp','w',' '])) p.digWish = false;
+
+  /* burrowing: the key is a hold, a soil click latches p.digWish */
+  if (p.breath > 35) p.gasping = false;
+  const canDig = p.onGround && diggable(p.x) && p.breath > 4 && !p.gasping;
+  p.digging = (kdig || p.digWish) && canDig;
+  p.burrow = clamp(p.burrow + (p.digging ? 1 : -1) * dt / CFG.digTime, 0, 1);
+  if (p.burrow > 0.6){
+    p.breath -= CFG.breathDrain * dt;
+    if (p.breath <= 0){ p.breath = 0; p.digWish = false; p.gasping = true; say('OUT OF BREATH!', 1.4); }
+    if (Math.random() < dt * 4) burst(p.x + p.w/2 + rnd(-6,6), GROUND_Y + 1, '#996c40', 1, 25, 0.35);
+  } else {
+    p.breath = clamp(p.breath + CFG.breathFill * dt, 0, CFG.breathMax);
+  }
+  const hidden = p.burrow > 0.6;
+  if (p.burrow > 0.05 && !p.diggingSfx){ p.diggingSfx = true; SFX.dig(); }
+  if (p.burrow <= 0.05) p.diggingSfx = false;
+
+  /* horizontal intent: keys, or a click target to walk to */
+  let dir = 0;
+  if (kl) dir -= 1;
+  if (kr) dir += 1;
+  if (!dir && p.moveTarget !== null && p.moveTarget !== undefined){
+    const d = p.moveTarget - (p.x + p.w/2);
+    if (Math.abs(d) < 4) p.moveTarget = null;
+    else dir = sign(d);
+  }
+  const spd = CFG.catSpeed * (p.burrow > 0.2 ? 0.45 : 1);
+  p.vx = lerp(p.vx, dir * spd, p.onGround ? 0.35 : 0.12);
+  if (dir) p.face = sign(dir);
+
+  /* jump - blocked while underground */
+  const wantJump = hitAny(['ArrowUp','w',' ']);
+  if (wantJump && p.onGround && p.burrow < 0.2){ p.vy = -CFG.catJump; p.onGround = false; SFX.jump(); }
+  /* auto-hop toward a clicked leaf that sits above us */
+  if (p.eatTarget && p.onGround && p.burrow < 0.2){
+    const l = p.eatTarget;
+    if (l.amount <= 0.06) p.eatTarget = null;
+    else if (l.y < p.y - 5 && Math.abs((l.x + l.w/2) - (p.x + p.w/2)) < 26){ p.vy = -CFG.catJump; SFX.jump(); }
+  }
+
+  if (p.burrow > 0.5){ p.vy = 0; p.y = GROUND_Y - p.h; p.onGround = true; p.x += p.vx * dt; }
+  else { p.vy += CFG.grav * dt; moveEntity(p, dt, true); }
+  p.x = clamp(p.x, 2, WORLD_W - p.w - 2);
+  p.anim += Math.abs(p.vx) * dt * 0.5;
+
+  /* eating */
+  const near = nearestLeaf(p);
+  if (!hidden){
+    if (near && heldAny(['e'])) eatLeaf(near, CFG.nibbleRate * dt);
+    else if (p.eatTarget && near === p.eatTarget) eatLeaf(near, CFG.nibbleRate * dt);
+  }
+  if (p.eatTarget && p.eatTarget.amount <= 0.06){ p.eatTarget = null; p.moveTarget = null; }
+  p.near = near;
+
+  /* bug contact: stomp beats being bitten, and digging in makes you untouchable */
+  if (!catSafe()){
+    for (const b of bugs){
+      if (b.dead) continue;
+      if (!aabb(p, b)) continue;
+      if (p.vy > 30 && (p.y + p.h) - b.y < 7 && b.stun <= 0){
+        b.stun = 1.6; b.vx = p.vx * 0.4; p.vy = -165;
+        burst(b.x + b.w/2, b.y, '#c9d2de', 6, 60, 0.35);
+        beep(520, 0.07, 'square', 0.05);
+      } else if (p.inv <= 0 && b.stun <= 0 && b.lunge > 0){   // only a real lunge bites
+        hurtPlayer(b.dmg, b.x + b.w/2);
+        b.retreat = 1.6; b.windup = 0; b.lunge = 0;   // it backs off after a bite
+      }
+    }
+  }
+}
+
+/* ---------- stage updates ----------------------------------------------- */
+function updateLarva(dt){
+  updateCat(dt);
+  updateBugs(dt);
+  state.spawnCd -= dt;
+  if (state.spawnCd <= 0 && bugs.length < 2 + state.gen){
+    state.spawnCd = Math.max(3.0, 8.0 / diff());
+    spawnEdgeBug();
+  }
+  if (state.fullness >= 1) setStage('nesting');
+}
+
+function updateNesting(dt){
+  updateCat(dt);
+  updateBugs(dt);
+  state.spawnCd -= dt;
+  if (state.spawnCd <= 0 && bugs.length < 2 + state.gen){
+    state.spawnCd = Math.max(3.0, 8.0 / diff());
+    spawnEdgeBug();
+  }
+  const p = player;
+  if (!p) return;
+  const box = { x: p.x - 6, y: p.y - 6, w: p.w + 12, h: p.h + 12 };
+  if (aabb(box, nest) && p.burrow < 0.3){
+    if (heldAny(['e']) || p.moveTarget === null){
+      const rate = heldAny(['e']) ? CFG.layRate : CFG.layRate * 0.45;
+      state.lay = clamp((state.lay || 0) + rate * dt, 0, 1);
+      if (Math.random() < dt * 3) burst(nest.x + rnd(4, 24), nest.y + 4, '#fffdf2', 1, 30, 0.3);
+    }
+  }
+  if ((state.lay || 0) >= 1){
+    state.lay = 0;
+    layEggs();
+    enterChrysalisStage();
+  }
+}
+
+function updateChrysalis(dt){
+  state.waveT = (state.waveT || 0) + dt;
+  if (state.waveT > 22 && !chry.cracking){
+    for (const b of bugs) b.rush = true;    // no bug gets to siege from safety forever
+  }
+  updateBugs(dt);
+  updateTurrets(dt);
+  if (chry.hurt) chry.hurt = Math.max(0, chry.hurt - dt);
+  if (eggs && eggs.hurt) eggs.hurt = Math.max(0, eggs.hurt - dt);
+  chry.wobble = Math.sin(state.t * 2.4) * 1.4;
+
+  if (state.spawnLeft > 0){
+    state.spawnCd -= dt;
+    if (state.spawnCd <= 0){
+      state.spawnCd = Math.max(0.4, 1.05 / diff());
+      state.spawnLeft--;
+      spawnEdgeBug();
+    }
+  }
+
+  if (eggs && eggs.hp <= 0){ gameOver(); return; }
+  if (chry.hp <= 0){
+    burst(chry.x + 5, chry.y + 7, '#6fe3b4', 24, 120);
+    say('The chrysalis fell - the eggs hatch early!', 3);
+    state.stage = 'rebirth'; state.stageT = 0; chry = null;
+    return;
+  }
+
+  if (chry.cracking){
+    chry.crack = clamp(chry.crack + CFG.crackRate * dt, 0, 1);
+    if (Math.random() < dt * 5) burst(chry.x + 5, chry.y + rnd(2,12), '#6fe3b4', 1, 35, 0.3);
+    if (chry.crack >= 1){
+      burst(chry.x + 5, chry.y + 7, '#ffd07a', 26, 130);
+      state.flash = 0.4;
+      setStage('butterfly');
+    }
+    return;
+  }
+
+  if (state.spawnLeft === 0 && bugs.length === 0){
+    if (state.wave >= state.wavesTotal){
+      chry.cracking = true;
+      say('All clear - the shell is cracking. CLICK IT!', 3.5);
+    } else {
+      setStage('upgrading');
+    }
+  }
+}
+
+function updateUpgrading(dt){
+  updateParts(dt);
+  const idx = ['1','2','3','4','5'].findIndex(k => hit(k));
+  if (idx >= 0) buyUpgrade(UPGRADES[idx]);
+  if (hitAny(['Enter',' '])) setStage('chrysalis');
+}
+
+function clawAt(ang){
+  const p = player;
+  if (!p || p.clawCd > 0) return;
+  p.clawCd = CFG.clawCd; p.claw = 0.17; p.clawAng = ang;
+  p.face = Math.cos(ang) >= 0 ? 1 : -1;
+  SFX.claw();
+  const hx = p.x + p.w/2 + Math.cos(ang) * 14;
+  const hy = p.y + p.h/2 + Math.sin(ang) * 14;
+  burst(hx, hy, '#ffd07a', 4, 70, 0.22);
+  for (const b of bugs){
+    if (b.dead) continue;
+    if (dist(hx, hy, b.x + b.w/2, b.y + b.h/2) < CFG.clawRange){
+      const finisher = b.stun > 0;               // teeth: a stunned bug gets bitten
+      damageBug(b, finisher ? b.hp + 99 : CFG.clawDmg, Math.cos(ang) * 110);
+      if (b.dead && finisher){
+        burst(b.x + b.w/2, b.y + b.h/2, '#ffffff', 8, 100, 0.4);
+        floatText(b.x + b.w/2, b.y - 4, 'BITE!', '#ffffff');
+        beep(300, 0.16, 'square', 0.06);
+      } else if (!b.dead){ b.stun = 0.75; b.vy = -70; }
+    }
+  }
+}
+
+function updateButterfly(dt){
+  const p = player;
+  let ax = 0, ay = 0;
+  if (heldAny(['ArrowLeft','a']))  ax -= 1;
+  if (heldAny(['ArrowRight','d'])) ax += 1;
+  if (heldAny(['ArrowUp','w']))    ay -= 1;
+  if (heldAny(['ArrowDown','s']))  ay += 1;
+  p.vx += ax * CFG.flyAccel * dt;
+  p.vy += ay * CFG.flyAccel * dt + CFG.flyGrav * dt;
+  p.vx -= p.vx * CFG.flyDrag * dt;
+  p.vy -= p.vy * CFG.flyDrag * dt;
+  const sp = Math.hypot(p.vx, p.vy);
+  if (sp > CFG.flySpeed){ p.vx *= CFG.flySpeed / sp; p.vy *= CFG.flySpeed / sp; }
+  p.x = clamp(p.x + p.vx * dt, 0, WORLD_W - p.w);
+  p.y = clamp(p.y + p.vy * dt, 4, GROUND_Y - p.h);
+  if (ax) p.face = sign(ax);
+  p.anim += dt * (7 + sp * 0.05);
+  p.claw = Math.max(0, p.claw - dt);
+  p.clawCd = Math.max(0, p.clawCd - dt);
+  p.hurtT = Math.max(0, p.hurtT - dt);
+
+  if (hitAny([' '])) clawAt(p.face > 0 ? 0 : Math.PI);
+
+  updateBugs(dt);
+  updateTurrets(dt);
+
+  /* contact with a bug also costs a little poison - they are filthy */
+  for (const b of bugs){
+    if (b.dead || b.stun > 0) continue;
+    if (aabb(p, b)){
+      state.poison = clamp(state.poison + 14 * dt, 0, CFG.poisonMax);
+      p.hurtT = 0.2;
+    }
+  }
+
+  /* the swarm builds the longer a butterfly lives - no generation lasts forever */
+  const pressure = 1 + state.stageT / 40;
+  state.spawnCd -= dt;
+  if (state.spawnCd <= 0 && bugs.length < 3 + state.gen * 2 + Math.floor(state.stageT / 25)){
+    state.spawnCd = Math.max(0.45, 3.0 / (diff() * pressure));
+    spawnEdgeBug();
+  }
+
+  if (eggs){
+    if (eggs.hurt) eggs.hurt = Math.max(0, eggs.hurt - dt);
+    if (eggs.hp <= 0){ gameOver(); return; }
+  }
+  if (state.poison < CFG.poisonMax)
+    state.poison = clamp(state.poison - CFG.poisonDecay * dt, 0, CFG.poisonMax);
+  else {
+    state.stage = 'dying'; state.stageT = 0;
+    p.vx = rnd(-40, 40); p.vy = -60; p.spin = 0;
+    SFX.die();
+    say('The poison wins... but the eggs remain.', 3);
+  }
+}
+
+function updateDying(dt){
+  const p = player;
+  if (p){
+    p.vy += 240 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.spin = (p.spin || 0) + dt * 7;
+    if (p.y + p.h > GROUND_Y){ p.y = GROUND_Y - p.h; p.vy *= -0.3; p.vx *= 0.6; }
+    if (Math.random() < dt * 8) burst(p.x + p.w/2, p.y + 6, '#7ad13a', 1, 30, 0.5);
+  }
+  updateBugs(dt);
+  updateTurrets(dt);
+  if (state.stageT > 2.0){ player = null; state.stage = 'rebirth'; state.stageT = 0; }
+}
+
+function updateRebirth(dt){
+  updateBugs(dt);
+  updateTurrets(dt);
+  if (eggs){
+    eggs.glow = state.stageT;
+    if (Math.random() < dt * 12) burst(eggs.x + rnd(0,16), eggs.y + 3, '#fffdf2', 1, 40, 0.5);
+  }
+  if (state.stageT > 2.0) hatchNext();
+}
+
+/* ---------- white silhouettes for hit flashes --------------------------- */
+const whiteCache = new Map();
+function whiteOf(img){
+  if (whiteCache.has(img)) return whiteCache.get(img);
+  const cv = document.createElement('canvas');
+  cv.width = img.width; cv.height = img.height;
+  const c = cv.getContext('2d');
+  c.drawImage(img, 0, 0);
+  c.globalCompositeOperation = 'source-in';
+  c.fillStyle = '#ffffff';
+  c.fillRect(0, 0, cv.width, cv.height);
+  whiteCache.set(img, cv);
+  return cv;
+}
+function blitFrac(img, x, y, frac, fromRight){
+  const w = Math.max(0, Math.round(img.width * frac));
+  if (w <= 0) return;
+  if (fromRight)
+    ctx.drawImage(img, img.width - w, 0, w, img.height,
+                  Math.round(x + img.width - w), Math.round(y), w, img.height);
+  else
+    ctx.drawImage(img, 0, 0, w, img.height, Math.round(x), Math.round(y), w, img.height);
+}
+
+/* ---------- drawing ----------------------------------------------------- */
+function drawSky(){
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  g.addColorStop(0,   '#6ec6ee');
+  g.addColorStop(0.55,'#a9e0f2');
+  g.addColorStop(1,   '#e3f3d4');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, VW, GROUND_Y);
+
+  /* sun */
+  px(VW - 74, 22, 18, 18, '#fff3b0');
+  px(VW - 70, 18, 10, 26, '#fff3b0');
+  px(VW - 78, 26, 26, 10, '#fff3b0');
+
+  /* parallax hills */
+  const off = -cam.x * 0.3;
+  ctx.fillStyle = '#7fb36a';
+  for (let i = -1; i < 4; i++){
+    const bx = off + i * 210 + 40;
+    ctx.beginPath();
+    ctx.moveTo(bx - 120, GROUND_Y);
+    ctx.quadraticCurveTo(bx, GROUND_Y - 84, bx + 120, GROUND_Y);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#63a055';
+  const off2 = -cam.x * 0.5;
+  for (let i = -1; i < 5; i++){
+    const bx = off2 + i * 160 + 110;
+    ctx.beginPath();
+    ctx.moveTo(bx - 90, GROUND_Y);
+    ctx.quadraticCurveTo(bx, GROUND_Y - 52, bx + 90, GROUND_Y);
+    ctx.fill();
+  }
+  /* clouds */
+  ctx.fillStyle = 'rgba(255,255,255,.75)';
+  for (let i = 0; i < 5; i++){
+    const cx2 = ((i * 190 + state.t * 5 - cam.x * 0.15) % (VW + 160)) - 80;
+    const cy2 = 18 + (i * 23) % 46;
+    px(cx2, cy2, 30, 6, 'rgba(255,255,255,.8)');
+    px(cx2 + 7, cy2 - 4, 16, 6, 'rgba(255,255,255,.8)');
+  }
+}
+
+function drawGround(){
+  px(0 - cam.x, GROUND_Y, WORLD_W, VH - GROUND_Y, '#6a4726');
+  px(0 - cam.x, GROUND_Y, WORLD_W, 3, '#4f9c2e');
+  px(0 - cam.x, GROUND_Y + 3, WORLD_W, 1, '#2f6b1f');
+  for (let x = 0; x < WORLD_W; x += 7){
+    const h = 2 + ((x * 13) % 3);
+    px(x - cam.x, GROUND_Y - h, 1, h, (x % 14 === 0) ? '#7ed24d' : '#4f9c2e');
+  }
+  for (let i = 0; i < 120; i++){
+    const x = (i * 47) % WORLD_W, y = GROUND_Y + 8 + ((i * 29) % (VH - GROUND_Y - 10));
+    px(x - cam.x, y, 2, 1, (i % 3 === 0) ? '#996c40' : '#583a1e');
+  }
+}
+
+function drawPlants(){
+  for (const s of stems){
+    const sway = Math.sin(state.t * 1.2 + s.sway) * 1.2;
+    for (let y = 0; y < s.h; y++){
+      const t = y / s.h;
+      px(s.x - cam.x + sway * (1 - t), s.y + y, s.w, 1, y % 9 < 5 ? '#4f9c2e' : '#3d7d24');
+    }
+  }
+  for (const l of leaves){
+    if (l.amount <= 0.02) continue;
+    const bob = Math.sin(state.t * 1.5 + l.bob) * 1;
+    const img = SPR.leaf[l.flip ? 1 : 0];
+    blitFrac(img, l.x - cam.x, l.y - 3 + bob, l.amount, l.flip);
+    if (state.hover && state.hover.kind === 'leaf' && state.hover.ref === l){
+      ctx.strokeStyle = 'rgba(255,255,255,.85)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(Math.round(l.x - cam.x) - 1.5, Math.round(l.y - 4 + bob) - 0.5, l.w + 3, 12);
+    }
+  }
+}
+
+function drawLog(){
+  blit(SPR.log, log.x - cam.x, log.y);
+  /* the nest hollow */
+  const pulse = (state.stage === 'nesting') ? (0.5 + 0.5 * Math.sin(state.t * 5)) : 0;
+  px(nest.x - cam.x, nest.y, nest.w, nest.h, '#4a2f18');
+  px(nest.x + 2 - cam.x, nest.y + 2, nest.w - 4, nest.h - 3, '#3a2412');
+  if (pulse > 0){
+    ctx.globalAlpha = 0.25 + pulse * 0.4;
+    px(nest.x - cam.x, nest.y, nest.w, nest.h, '#ffd07a');
+    ctx.globalAlpha = 1;
+    if (state.stage === 'nesting')
+      shadowText('NEST', nest.x + nest.w/2 - cam.x, nest.y - 12, '#ffd07a', 'center');
+  }
+  /* the branch the chrysalis hangs from */
+  px(branch.x - 58 - cam.x, branch.y - 6, 116, 3, '#6a4726');
+  px(branch.x - 58 - cam.x, branch.y - 3, 116, 1, '#4a2f18');
+}
+
+function drawEggs(){
+  if (!eggs) return;
+  const hurt = eggs.hurt > 0;
+  const img = hurt ? whiteOf(SPR.eggs) : SPR.eggs;
+  const glow = state.stage === 'rebirth' ? (0.5 + 0.5 * Math.sin(state.t * 12)) : 0;
+  if (glow > 0){
+    ctx.globalAlpha = 0.35 * glow;
+    px(eggs.x - 4 - cam.x, eggs.y - 4, eggs.w + 8, eggs.h + 8, '#fff3b0');
+    ctx.globalAlpha = 1;
+  }
+  blit(img, eggs.x - cam.x, eggs.y);
+  bar(eggs.x - cam.x - 2, eggs.y - 7, 20, 3, eggs.hp / eggs.maxHp, '#efe6cf', '#5b2f18');
+}
+
+function drawChrysalis(){
+  if (!chry) return;
+  const cx2 = chry.x + chry.w/2 - cam.x;
+  px(cx2 - 1, branch.y - 8, 2, 10, '#e8eef5');
+  const img = chry.hurt > 0 ? whiteOf(SPR.chry) : SPR.chry;
+  const shake = chry.cracking ? rnd(-1, 1) : chry.wobble;
+  blit(img, chry.x - cam.x + shake, chry.y);
+  if (chry.cracking){
+    ctx.strokeStyle = '#14181e'; ctx.lineWidth = 1;
+    const n = Math.floor(chry.crack * 5);
+    for (let i = 0; i < n; i++){
+      ctx.beginPath();
+      ctx.moveTo(cx2 - 4, chry.y + 3 + i * 3);
+      ctx.lineTo(cx2 + 4, chry.y + 5 + i * 3);
+      ctx.stroke();
+    }
+    bar(chry.x - cam.x - 3, chry.y - 22, 19, 3, chry.crack, '#ffd07a', '#3a2412');
+  } else {
+    bar(chry.x - cam.x - 3, chry.y - 22, 19, 3, chry.hp / chry.maxHp, '#6fe3b4', '#1d3a30');
+  }
+}
+
+function drawTurrets(){
+  for (const t of turrets){
+    const bx = t.x + 4 - cam.x, by = t.y + 3;
+    for (let i = 3; i < 9; i++)
+      px(bx + Math.cos(t.aim) * i, by + Math.sin(t.aim) * i, 1, 1, '#c9d2de');
+    blit(SPR.turret, t.x - cam.x, t.y);
+    if (t.flash > 0){
+      px(bx + Math.cos(t.aim) * 9 - 1, by + Math.sin(t.aim) * 9 - 1, 3, 3, '#fff3b0');
+    }
+  }
+}
+
+function drawBugs(){
+  for (const b of bugs){
+    const set = SPR[b.type];
+    let img = set[b.face > 0 ? 0 : 1];
+    if (b.flash > 0) img = whiteOf(img);
+    const hop = (!b.flying && Math.abs(b.vx) > 3) ? (Math.sin(b.anim) > 0 ? -1 : 0) : 0;
+    const wob = b.flying ? Math.sin(b.anim * 1.6) * 1.5 : 0;
+    blit(img, b.x - cam.x, b.y + hop + wob);
+    if (b.windup > 0) shadowText('!', b.x + b.w/2 - cam.x, b.y - 9, '#ff5a4a', 'center');
+    if (b.stun > 0){
+      const a = state.t * 8;
+      px(b.x + b.w/2 - cam.x + Math.cos(a)*4, b.y - 5 + Math.sin(a)*1.5, 1, 1, '#fff3b0');
+      px(b.x + b.w/2 - cam.x - Math.cos(a)*4, b.y - 5 - Math.sin(a)*1.5, 1, 1, '#fff3b0');
+    }
+    if (b.maxHp > 2 && b.hp < b.maxHp)
+      bar(b.x - cam.x, b.y - 4, b.w, 2, b.hp / b.maxHp, '#dd6a55', '#3a2412');
+  }
+}
+
+function drawShots(){
+  for (const s of shots){
+    if (s.friendly){
+      px(s.x - cam.x - 1, s.y - 1, 2, 2, '#fff3b0');
+      px(s.x - cam.x - 2, s.y, 1, 1, 'rgba(255,243,176,.5)');
+    } else {
+      px(s.x - cam.x - 1, s.y - 1, 3, 3, '#7ad13a');
+      px(s.x - cam.x, s.y, 1, 1, '#c4f27a');
+    }
+  }
+}
+
+function drawParts(){
+  for (const p of parts){
+    const a = 1 - p.t / p.life;
+    ctx.globalAlpha = clamp(a, 0, 1);
+    px(p.x - cam.x, p.y, p.sz || 1, p.sz || 1, p.col);
+  }
+  ctx.globalAlpha = 1;
+  for (const f of floats){
+    ctx.globalAlpha = clamp(1 - f.t / 1.1, 0, 1);
+    shadowText(f.str, f.x - cam.x, f.y, f.col, 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawPlayer(){
+  const p = player;
+  if (!p) return;
+  if (p.inv > 0 && Math.floor(state.t * 20) % 2 === 0 && p.hurtT <= 0) return;
+
+  if (p.kind === 'cat'){
+    const sink = p.burrow * 11;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, VW, GROUND_Y + 2); ctx.clip();
+    let img;
+    if (p.burrow > 0.05) img = SPR.catBall[p.face > 0 ? 0 : 1];
+    else img = SPR.cat[Math.floor(p.anim) % 2][p.face > 0 ? 0 : 1];
+    if (p.hurtT > 0) img = whiteOf(img);
+    blit(img, p.x - cam.x - (p.burrow > 0.05 ? 3 : 0), p.y + sink);
+    ctx.restore();
+    if (p.burrow > 0.35) blit(SPR.mound, p.x + p.w/2 - 6 - cam.x, GROUND_Y - 3);
+    /* eating tell */
+    if (p.near && p.burrow < 0.2 && (heldAny(['e']) || p.eatTarget === p.near)){
+      const l = p.near;
+      px(l.x + l.w * l.amount - cam.x - 1, l.y + rnd(-1, 4), 2, 2, '#9ee86a');
+    }
+  } else {
+    const frame = Math.floor(p.anim) % 2;
+    let img = SPR.bfly[frame][p.face > 0 ? 0 : 1];
+    if (p.hurtT > 0) img = whiteOf(img);
+    if (state.stage === 'dying'){
+      ctx.save();
+      ctx.translate(Math.round(p.x + p.w/2 - cam.x), Math.round(p.y + p.h/2));
+      ctx.rotate(p.spin || 0);
+      ctx.drawImage(img, -Math.round(p.w/2), -Math.round(p.h/2));
+      ctx.restore();
+    } else {
+      blit(img, p.x - cam.x, p.y);
+    }
+    if (p.claw > 0){
+      const a0 = p.clawAng - 0.7, a1 = p.clawAng + 0.7;
+      const cx2 = p.x + p.w/2 - cam.x, cy2 = p.y + p.h/2;
+      for (let i = 0; i <= 8; i++){
+        const a = lerp(a0, a1, i/8);
+        px(cx2 + Math.cos(a) * 15, cy2 + Math.sin(a) * 15, 2, 2, i % 2 ? '#ffffff' : '#ffd07a');
+      }
+    }
+  }
+}
+
+/* ---------- HUD --------------------------------------------------------- */
+function bar(x, y, w, h, frac, col, bg, label){
+  px(x - 1, y - 1, w + 2, h + 2, 'rgba(0,0,0,.45)');
+  px(x, y, w, h, bg || '#22303a');
+  px(x, y, Math.max(0, Math.round(w * clamp(frac, 0, 1))), h, col);
+  if (label) shadowText(label, x + w + 4, y - 1, '#ffffff');
+}
+
+function drawHud(){
+  shadowText('GEN ' + state.gen, 6, 5, '#ffffff');
+  shadowText('LEAF ' + Math.floor(state.leafPoints), 6, 15, '#f7c93f');
+  shadowText('BEST GEN ' + state.best, VW - 6, 5, '#c9d2de', 'right');
+  shadowText('BUGS ' + state.bugsKilled, VW - 6, 15, '#c9d2de', 'right');
+
+  const st = state.stage;
+  if ((st === 'larva' || st === 'nesting') && player){
+    bar(70, 6, 84, 6, state.fullness, '#7ed24d', '#1c2a16', 'FULL');
+    for (let i = 0; i < CFG.catHpMax; i++){
+      const on = i < player.hp;
+      px(70 + i * 9, 16, 7, 6, on ? '#dd6a55' : 'rgba(0,0,0,.35)');
+      if (on) px(71 + i * 9, 17, 2, 2, '#ffb0a0');
+    }
+    if (player.burrow > 0.02 || player.breath < CFG.breathMax)
+      bar(70, 26, 60, 4, player.breath / CFG.breathMax, '#6ec6ee', '#1d3a4a', 'AIR');
+  }
+  if (st === 'chrysalis' || st === 'upgrading'){
+    const label = chry && chry.cracking ? 'CRACKING' : 'WAVE ' + Math.max(1, state.wave) + '/' + state.wavesTotal;
+    shadowText(label, VW/2, 5, '#ffffff', 'center');
+    if (chry) bar(VW/2 - 42, 16, 84, 5, chry.hp / chry.maxHp, '#6fe3b4', '#1d3a30', 'SHELL');
+    if (eggs) bar(VW/2 - 42, 25, 84, 5, eggs.hp / eggs.maxHp, '#efe6cf', '#5b2f18', 'EGGS');
+  }
+  if (st === 'butterfly' || st === 'dying'){
+    bar(VW/2 - 52, 6, 104, 6, state.poison / CFG.poisonMax, '#7ad13a', '#22303a', 'POISON');
+    if (eggs) bar(VW/2 - 52, 17, 104, 5, eggs.hp / eggs.maxHp, '#efe6cf', '#5b2f18', 'EGGS');
+  }
+
+  if (state.msgT > 0){
+    ctx.globalAlpha = clamp(state.msgT, 0, 1);
+    const w = ctx.measureText(state.msg).width + 14;
+    px(VW/2 - w/2, VH - 26, w, 13, 'rgba(0,0,0,.55)');
+    shadowText(state.msg, VW/2, VH - 23, '#ffffff', 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawPanel(){
+  px(PANEL.x, PANEL.y, PANEL.w, PANEL.h, 'rgba(12,18,24,.92)');
+  ctx.strokeStyle = '#6fe3b4'; ctx.lineWidth = 1;
+  ctx.strokeRect(PANEL.x + 0.5, PANEL.y + 0.5, PANEL.w - 1, PANEL.h - 1);
+  shadowText('ARM THE CHRYSALIS', PANEL.x + PANEL.w/2, PANEL.y + 8, '#6fe3b4', 'center');
+  shadowText('LEAF POINTS: ' + Math.floor(state.leafPoints), PANEL.x + PANEL.w/2, PANEL.y + 19, '#f7c93f', 'center');
+
+  UPGRADES.forEach((u, i) => {
+    const r = { x: PANEL.x + 12, y: PANEL.y + 34 + i * 20, w: PANEL.w - 24, h: 17 };
+    const maxed = upMaxed(u), cost = upCost(u);
+    const afford = state.leafPoints >= cost && !maxed;
+    const hov = state.hover && state.hover.kind === 'upgrade' && state.hover.ref === u;
+    px(r.x, r.y, r.w, r.h, hov && afford ? 'rgba(111,227,180,.30)' : 'rgba(255,255,255,.07)');
+    ctx.strokeStyle = afford ? '#6fe3b4' : 'rgba(255,255,255,.18)';
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    const lv = upLevel(u) - (u.id === 'turrets' ? 1 : 0);
+    shadowText((i+1) + '. ' + u.name + '  Lv' + lv, r.x + 6, r.y + 5, afford ? '#ffffff' : '#8d97a3');
+    shadowText(maxed ? 'MAX' : cost + ' lf', r.x + r.w - 6, r.y + 5, maxed ? '#8d97a3' : (afford ? '#f7c93f' : '#8d97a3'), 'right');
+  });
+
+  const b = { x: PANEL.x + 72, y: PANEL.y + PANEL.h - 26, w: 144, h: 18 };
+  const hovB = state.hover && state.hover.kind === 'startwave';
+  px(b.x, b.y, b.w, b.h, hovB ? '#6fe3b4' : 'rgba(111,227,180,.25)');
+  ctx.strokeStyle = '#6fe3b4';
+  ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+  shadowText('START WAVE ' + (state.wave + 1) + '  [ENTER]', b.x + b.w/2, b.y + 6,
+             hovB ? '#0c1218' : '#ffffff', 'center');
+}
+
+function drawOverlays(){
+  if (state.stage === 'title'){
+    px(0, 0, VW, VH, 'rgba(8,14,10,.62)');
+    shadowText('CATERPILLAR  LIFE', VW/2, 68, '#9ee86a', 'center');
+    ctx.font = '8px "Courier New",Courier,monospace';
+    const lines = [
+      'Eat the garden. Hide your eggs. Pupate behind guns.',
+      'Fly as a butterfly with claws and teeth.',
+      'Poison will take you - the eggs carry you on.',
+      '',
+      'MOVE  arrows / A D      JUMP  W / up / space',
+      'HIDE  S / down (burrow, you are safe but airless)',
+      'EAT   hold E  -  or CLICK a leaf to bite it faster',
+      'FLY   arrows      CLAW  space or click a bug',
+      '',
+      'CLICK ANYWHERE TO BEGIN',
+    ];
+    lines.forEach((l, i) => shadowText(l, VW/2, 92 + i * 12, i === lines.length-1 ? '#f7c93f' : '#dfe7ee', 'center'));
+  }
+  if (state.paused){
+    px(0, 0, VW, VH, 'rgba(8,14,10,.6)');
+    shadowText('PAUSED  [P]', VW/2, VH/2 - 4, '#ffffff', 'center');
+  }
+  if (state.stage === 'gameover'){
+    px(0, 0, VW, VH, 'rgba(30,8,8,.72)');
+    shadowText(state.overTitle || 'THE CLUTCH IS GONE', VW/2, 74, '#dd6a55', 'center');
+    shadowText(state.overSub || 'Nothing was left to hatch.', VW/2, 90, '#dfe7ee', 'center');
+    shadowText('GENERATIONS SURVIVED : ' + (state.gen - 1), VW/2, 112, '#ffffff', 'center');
+    shadowText('BUGS KILLED          : ' + state.bugsKilled, VW/2, 124, '#ffffff', 'center');
+    shadowText('LEAVES EATEN         : ' + state.leavesEaten, VW/2, 136, '#ffffff', 'center');
+    shadowText('BEST : ' + state.best, VW/2, 154, '#f7c93f', 'center');
+    const r = { x: VW/2 - 60, y: 186, w: 120, h: 18 };
+    const hov = state.hover && state.hover.kind === 'restart';
+    px(r.x, r.y, r.w, r.h, hov ? '#dd6a55' : 'rgba(221,106,85,.3)');
+    ctx.strokeStyle = '#dd6a55'; ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    shadowText('TRY AGAIN  [R]', r.x + r.w/2, r.y + 6, '#ffffff', 'center');
+  }
+  if (state.flash > 0){
+    ctx.globalAlpha = clamp(state.flash, 0, 1) * 0.7;
+    px(0, 0, VW, VH, '#ffffff');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function draw(){
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, VW, VH);
+  const sh = state.shake > 0 ? state.shake : 0;
+  ctx.save();
+  if (sh > 0) ctx.translate(Math.round(rnd(-sh, sh)), Math.round(rnd(-sh, sh)));
+  drawSky();
+  drawPlants();
+  drawLog();
+  drawGround();
+  drawEggs();
+  drawChrysalis();
+  drawTurrets();
+  drawBugs();
+  drawPlayer();
+  drawShots();
+  drawParts();
+  ctx.restore();
+  drawHud();
+  if (state.stage === 'upgrading') drawPanel();
+  drawOverlays();
+
+  vctx.setTransform(1, 0, 0, 1, 0, 0);
+  vctx.imageSmoothingEnabled = false;
+  vctx.drawImage(buf, 0, 0, VW, VH, 0, 0, VW * scale, VH * scale);
+}
+
+/* ---------- camera, update, loop ---------------------------------------- */
+function updateCamera(dt){
+  let tx;
+  if (player) tx = player.x + player.w/2 - VW/2;
+  else if (chry) tx = chry.x + chry.w/2 - VW/2;
+  else if (eggs) tx = eggs.x - VW/2;
+  else tx = branch.x - VW/2;
+  const k = 1 - Math.pow(0.0009, dt);
+  cam.x = clamp(lerp(cam.x, tx, k), 0, WORLD_W - VW);
+}
+
+function debugGoto(name){
+  if (name === 'larva'){ setStage('larva'); return; }
+  if (name === 'nesting'){ state.fullness = 1; setStage('nesting'); return; }
+  if (name === 'chrysalis'){
+    if (!eggs) layEggs();
+    state.leafPoints += 120;
+    enterChrysalisStage();
+    return;
+  }
+  if (name === 'butterfly'){
+    if (!eggs) layEggs();
+    if (!chry) enterChrysalisStage();
+    setStage('butterfly');
+  }
+}
+const DBG_ORDER = ['larva','nesting','chrysalis','butterfly'];
+
+function update(dt){
+  state.t += dt;
+  state.stageT += dt;
+  state.msgT = Math.max(0, state.msgT - dt);
+  state.shake = Math.max(0, state.shake - dt * 16);
+  state.flash = Math.max(0, state.flash - dt * 2.5);
+
+  if (hit('m')) muted = !muted;
+  if (hit('p') && state.stage !== 'title' && state.stage !== 'gameover') state.paused = !state.paused;
+  if (hit('r') && state.stage !== 'title') resetRun();
+  if (DEBUG){
+    if (hit('k')) bugs.forEach(b => damageBug(b, 999, 0));
+    if (hit('[') || hit(']')){
+      let i = DBG_ORDER.indexOf(['upgrading','chrysalis'].indexOf(state.stage) >= 0 ? 'chrysalis' : state.stage);
+      if (i < 0) i = 0;
+      i = clamp(i + (hit(']') ? 1 : -1), 0, DBG_ORDER.length - 1);
+      debugGoto(DBG_ORDER[i]);
+    }
+    if (hit('g')){
+      if (state.stage === 'larva') state.fullness = 1;
+      else if (state.stage === 'butterfly') state.poison = CFG.poisonMax;
+      else if (state.stage === 'chrysalis') bugs.forEach(b => damageBug(b, 999, 0));
+    }
+    if (hit('h') && eggs) eggs.hp = 0;
+  }
+
+  buildClickables();
+  state.hover = findTarget(mouse.x, mouse.y);
+  handleClicks();
+
+  if (!state.paused){
+    switch (state.stage){
+      case 'larva':      updateLarva(dt); break;
+      case 'nesting':    updateNesting(dt); break;
+      case 'chrysalis':  updateChrysalis(dt); break;
+      case 'upgrading':  updateUpgrading(dt); break;
+      case 'butterfly':  updateButterfly(dt); break;
+      case 'dying':      updateDying(dt); break;
+      case 'rebirth':    updateRebirth(dt); break;
+    }
+    if (state.stage !== 'upgrading'){ updateShots(dt); updateParts(dt); }
+    updateCamera(dt);
+  }
+  tapped.clear();
+  mouse.down = false;
+}
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+/* expose a little state for automated smoke tests */
+window.CL = { state, CFG, debugGoto,
+              get player(){ return player; }, get eggs(){ return eggs; },
+              get chry(){ return chry; }, get bugs(){ return bugs; },
+              get camX(){ return cam.x; }, get leaves(){ return leaves; } };
+
+buildGarden();
+cam.x = clamp(branch.x - VW/2, 0, WORLD_W - VW);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
