@@ -2390,6 +2390,10 @@ function drawMenu(){
   txt(go, cx, y, blink ? C.good : C.dim, clamp(16*s, 12, 18), 'center', 'alphabetic', 'bold');
   y += clamp(30*s, 20, 34);
 
+  if(!IS_TOUCH && window.self !== window.top){
+    txt('click the page once so the keyboard reaches it', cx, y, C.warn, clamp(11*s, 9, 12), 'center');
+    y += clamp(20*s, 15, 22);
+  }
   if(IS_TOUCH && UI.h > UI.w){
     txt('turn the phone sideways for more sky', cx, y, C.dim, clamp(11*s, 9, 12), 'center');
     y += clamp(20*s, 15, 22);
