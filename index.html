@@ -25,8 +25,9 @@
 
 /* ==========================================================================
    CATERPILLAR LIFE
-   A single-file life-cycle game. Eat -> lay eggs -> pupate -> fly -> die ->
+   A single-file life-cycle game. Eat -> lay eggs -> pupate -> fly -> rest ->
    hatch again. The loop is the game; losing the eggs is the only real end.
+   Nothing in this garden is harmed: bugs that lose their nerve simply leave.
    ========================================================================== */
 
 /* ---------- config ------------------------------------------------------ */
@@ -59,19 +60,18 @@ const CFG = {
   flyAccel:    620,
   flyDrag:     2.6,
   flyGrav:     58,
-  clawCd:      0.30,
-  clawDmg:     3,
-  clawRange:   26,
-  poisonMax:   120,
-  poisonHit:   11,
-  poisonDecay: 1.6,
+  gustCd:      0.30,
+  gustPower:   3,
+  gustRange:   26,
+  tiredMax:    120,
+  tiredHit:    11,
+  tiredDecay:  1.6,
 
   eggHpBase:   14,
   chryHpBase:  12,
-  turretRange: 122,
-  turretRate:  1.4,
-  turretDmg:   1,
-  pelletSpeed: 235,
+  ladyRange:   128,      // how far a ladybug will go to meet an intruder
+  ladySpeed:   112,
+  puffSpeed:   130,
 };
 
 /* ---------- tiny helpers ------------------------------------------------ */
@@ -297,14 +297,14 @@ SPR.eggs = spr([
   '...ee....ee.....',
 ]);
 
-SPR.turret = spr([
-  '..aaaaa..',
-  '.aAAAAAa.',
-  'aAAaaaAAa',
-  'aAAAAAAAa',
-  '.aAAAAAa.',
-  '..aaaaa..',
-  '...aaa...',
+SPR.lady = pair([
+  '..kkkkk...',
+  '.rRRRRRr..',
+  'rRkRRkRRrk',
+  'rRRRkRRRkW',
+  'rRkRRkRRrk',
+  '.rRRRRRr..',
+  '..rrrrr...',
 ]);
 
 SPR.log = spr([
@@ -426,20 +426,21 @@ const SFX = {
   jump:  () => beep(420, 0.08, 'square', 0.035),
   dig:   () => beep(90, 0.16, 'sawtooth', 0.045),
   hurt:  () => beep(120, 0.22, 'sawtooth', 0.07),
-  shoot: () => beep(660, 0.05, 'square', 0.03),
-  kill:  () => beep(rnd(200,260), 0.14, 'square', 0.05),
-  claw:  () => beep(520, 0.07, 'sawtooth', 0.05),
+  flit:  () => beep(880, 0.04, 'triangle', 0.025),
+  shoo:  () => { beep(rnd(420,520), 0.07, 'square', 0.04);
+                 setTimeout(() => beep(rnd(620,760), 0.1, 'square', 0.04), 70); },
+  gust:  () => beep(300, 0.12, 'sine', 0.05),
   buy:   () => beep(780, 0.1, 'triangle', 0.06),
   lay:   () => beep(rnd(500,620), 0.09, 'triangle', 0.05),
   born:  () => { beep(440,0.12,'triangle',0.06); setTimeout(()=>beep(660,0.16,'triangle',0.06),120); },
-  die:   () => { beep(220,0.3,'sawtooth',0.07); setTimeout(()=>beep(140,0.45,'sawtooth',0.07),160); },
+  settle:() => { beep(392,0.3,'sine',0.06); setTimeout(()=>beep(262,0.5,'sine',0.06),200); },
 };
 
 /* ---------- world ------------------------------------------------------- */
 const clickQ = [];
 view.addEventListener('pointerdown', ev => { const p = toBuffer(ev); clickQ.push(p); });
 
-let leaves = [], stems = [], bugs = [], shots = [], parts = [], turrets = [], floats = [];
+let leaves = [], stems = [], bugs = [], puffs = [], parts = [], ladybugs = [], floats = [];
 let player = null, eggs = null, chry = null;
 const cam = { x: 0 };
 const log  = { x: 398, y: GROUND_Y - 16, w: 52, h: 16 };
@@ -448,10 +449,10 @@ const branch = { x: nest.x + nest.w/2, y: GROUND_Y - 104 };
 
 const state = {
   stage: 'title', t: 0, stageT: 0,
-  gen: 1, leafPoints: 0, bugsKilled: 0, leavesEaten: 0,
-  fullness: 0, poison: 0,
+  gen: 1, leafPoints: 0, bugsShooed: 0, leavesEaten: 0,
+  fullness: 0, tired: 0,
   wave: 0, wavesTotal: 3, spawnLeft: 0, spawnCd: 0,
-  up: { turrets: 1, rate: 0, dmg: 0, shell: 0, egg: 0 },
+  up: { lady: 1, speed: 0, sap: 0, shell: 0, egg: 0 },
   paused: false, hover: null, clickables: [],
   best: parseInt(localStorage.getItem('cl_best') || '0', 10) || 0,
   shake: 0, flash: 0, msg: '', msgT: 0,
@@ -490,19 +491,19 @@ function floatText(x, y, str, col){ floats.push({ x, y, str, col, t: 0 }); }
 
 /* ---------- entities ---------------------------------------------------- */
 const BUG_BASE = {
-  ant:     { w: 9,  h: 6, hp: 2, speed: 46, dmg: 1, chew: 1.2, score: 1 },
-  beetle:  { w: 11, h: 8, hp: 5, speed: 30, dmg: 1, chew: 2.0, score: 2 },
-  spitter: { w: 11, h: 8, hp: 3, speed: 27, dmg: 1, chew: 1.0, score: 3 },
-  flyer:   { w: 11, h: 7, hp: 2, speed: 58, dmg: 1, chew: 1.2, score: 2 },
+  ant:     { w: 9,  h: 6, calm: 2, speed: 46, dmg: 1, chew: 1.2, score: 1 },
+  beetle:  { w: 11, h: 8, calm: 5, speed: 30, dmg: 1, chew: 2.0, score: 2 },
+  spitter: { w: 11, h: 8, calm: 3, speed: 27, dmg: 1, chew: 1.0, score: 3 },
+  flyer:   { w: 11, h: 7, calm: 2, speed: 58, dmg: 1, chew: 1.2, score: 2 },
 };
 
 function spawnBug(type, x, y){
   const b0 = BUG_BASE[type];
-  const hp = Math.max(1, Math.round(b0.hp * (1 + (state.gen - 1) * 0.28)));
+  const calm = Math.max(1, Math.round(b0.calm * (1 + (state.gen - 1) * 0.28)));
   const b = {
     type, x, y: y === undefined ? GROUND_Y - b0.h : y,
     w: b0.w, h: b0.h, vx: 0, vy: 0,
-    hp, maxHp: hp, dmg: b0.dmg, chew: b0.chew, score: b0.score,
+    calm, maxCalm: calm, flee: false, dmg: b0.dmg, chew: b0.chew, score: b0.score,
     speed: b0.speed * (1 + (state.gen - 1) * 0.07),
     flying: type === 'flyer',
     face: -1, onGround: false, stun: 0, windup: 0, lunge: 0,
@@ -531,18 +532,22 @@ function spawnEdgeBug(){
   return b;
 }
 
-function damageBug(b, dmg, kx){
-  b.hp -= dmg;
+/* Nothing in this garden gets hurt. Fluster a bug enough and it loses its
+   nerve, turns tail and leaves the way it came. */
+function flusterBug(b, amount, kx){
+  if (b.flee) return;
+  b.calm -= amount;
   b.flash = 0.12;
   b.vx += (kx || 0);
-  if (b.hp <= 0){
-    b.dead = true;
-    state.bugsKilled++;
-    burst(b.x + b.w/2, b.y + b.h/2, '#8a5230', 9, 90);
-    burst(b.x + b.w/2, b.y + b.h/2, '#dd6a55', 5, 70);
-    SFX.kill();
+  if (b.calm <= 0){
+    b.flee = true;
+    b.fleeDir = sign((b.x + b.w/2) - (eggs ? eggs.x + 8 : branch.x)) || pick([-1, 1]);
+    state.bugsShooed++;
+    burst(b.x + b.w/2, b.y + b.h/2, '#c9d2de', 8, 80);
+    floatText(b.x + b.w/2, b.y - 6, 'EEK!', '#c9d2de');
+    SFX.shoo();
   } else {
-    burst(b.x + b.w/2, b.y + b.h/2, '#dd6a55', 3, 50, 0.25);
+    burst(b.x + b.w/2, b.y + b.h/2, '#e8eef5', 3, 50, 0.25);
   }
 }
 
@@ -590,9 +595,9 @@ function makeCaterpillar(x, y){
 function enterLarva(){
   const sx = eggs ? eggs.x : 96;
   buildGarden();
-  bugs = []; shots = []; turrets = [];
+  bugs = []; puffs = []; ladybugs = [];
   eggs = null; chry = null;
-  state.fullness = 0; state.poison = 0;
+  state.fullness = 0; state.tired = 0;
   player = makeCaterpillar(clamp(sx, 12, WORLD_W - 30), GROUND_Y - 8);
   player.inv = 1.6;                       // a moment to get your bearings
   const n = 1 + Math.min(4, state.gen);
@@ -612,7 +617,7 @@ function layEggs(){
   eggs = { x: nest.x + 5, y: nest.y - 2, w: 16, h: 6, hp: maxHp, maxHp, glow: 0 };
   SFX.lay();
   burst(eggs.x + 8, eggs.y + 3, '#fffdf2', 16, 70);
-  say('Eggs laid. Now pupate above them.', 3.5);
+  say('Eggs laid. Now pupate above them - ladybugs will watch.', 3.5);
 }
 
 function enterChrysalisStage(){
@@ -620,29 +625,34 @@ function enterChrysalisStage(){
   chry = { x: branch.x - 6, y: branch.y, w: 13, h: 21, hp: maxHp, maxHp,
            crack: 0, cracking: false, wobble: 0 };
   player = null;
-  turrets = [];
+  ladybugs = [];
   state.wavesTotal = 3 + Math.min(3, state.gen - 1);
   state.wave = 0;
-  rebuildTurrets();
+  rebuildLadybugs();
   setStage('upgrading');
 }
 
-/* absolute mounts: the first gun guards the clutch, the other two ride the branch */
-function mountAt(i){
-  if (i === 0) return { x: log.x + 3,       y: log.y - 7 };
-  if (i === 1) return { x: branch.x - 48,   y: branch.y - 13 };
-  return              { x: branch.x + 39,   y: branch.y - 13 };
+/* where each ladybug waits between escorts: one over the clutch, two on the branch */
+function perchAt(i){
+  if (i === 0) return { x: log.x + 10,     y: log.y - 14 };
+  if (i === 1) return { x: branch.x - 44,  y: branch.y - 16 };
+  return              { x: branch.x + 36,  y: branch.y - 16 };
 }
-function rebuildTurrets(){
-  turrets = [];
-  for (let i = 0; i < state.up.turrets; i++){
-    const m = mountAt(i);
-    turrets.push({ x: m.x, y: m.y, w: 9, h: 7, cd: 0, aim: -Math.PI/2, flash: 0 });
+function rebuildLadybugs(){
+  const keep = ladybugs.slice(0, state.up.lady);
+  ladybugs = [];
+  for (let i = 0; i < state.up.lady; i++){
+    const home = perchAt(i);
+    const old = keep[i];
+    ladybugs.push(old ? Object.assign(old, { home }) : {
+      x: home.x, y: home.y, w: 10, h: 7, vx: 0, vy: 0, face: 1,
+      home, target: null, cool: 0, anim: rnd(0, 9),
+    });
   }
 }
 
 function enterUpgrading(){
-  bugs = []; shots = [];
+  bugs = []; puffs = [];
   if (state.wave >= state.wavesTotal){ chry.cracking = true; setStage('chrysalis'); return; }
 }
 
@@ -659,17 +669,17 @@ function enterButterfly(){
   const cy = chry ? chry.y : branch.y;
   player = {
     kind: 'bfly', x: cx - 8, y: cy, w: 17, h: 12, vx: 0, vy: 0, face: 1,
-    anim: 0, claw: 0, clawCd: 0, hurtT: 0, inv: 0,
+    anim: 0, gust: 0, gustCd: 0, hurtT: 0, inv: 0,
   };
-  /* the guns came down with the shell - from here the claws are the defense */
-  for (const t of turrets) burst(t.x + 4, t.y + 3, '#5b6474', 7, 70, 0.5);
-  turrets = [];
+  /* the ladybugs' watch ends with the shell - the butterfly takes over now */
+  for (const lb of ladybugs) burst(lb.x + 5, lb.y + 3, '#dd6a55', 6, 70, 0.5);
+  ladybugs = [];
   chry = null;
-  state.poison = 0;
-  bugs = []; shots = [];
+  state.tired = 0;
+  bugs = []; puffs = [];
   state.spawnCd = 1.2;
   SFX.born();
-  say('BUTTERFLY!  SPACE to claw. Guard the eggs.', 4);
+  say('BUTTERFLY!  SPACE to flap. Shoo them off the eggs.', 4);
 }
 
 function hatchNext(){
@@ -687,16 +697,16 @@ function hatchNext(){
 function gameOver(title, sub){
   state.stage = 'gameover';
   state.stageT = 0;
-  state.overTitle = title || 'THE CLUTCH IS GONE';
-  state.overSub   = sub   || 'Nothing was left to hatch.';
+  state.overTitle = title || 'THE NEST IS EMPTY';
+  state.overSub   = sub   || 'The bugs carried off the last egg.';
   player = null; chry = null;
-  SFX.die();
+  SFX.settle();
 }
 
 function resetRun(){
-  state.gen = 1; state.leafPoints = 0; state.bugsKilled = 0; state.leavesEaten = 0;
-  state.up = { turrets: 1, rate: 0, dmg: 0, shell: 0, egg: 0 };
-  parts = []; floats = []; shots = []; bugs = [];
+  state.gen = 1; state.leafPoints = 0; state.bugsShooed = 0; state.leavesEaten = 0;
+  state.up = { lady: 1, speed: 0, sap: 0, shell: 0, egg: 0 };
+  parts = []; floats = []; puffs = []; bugs = [];
   eggs = null; chry = null;
   setStage('larva');
 }
@@ -704,13 +714,13 @@ function resetRun(){
 /* ---------- clickable targets ------------------------------------------- */
 const PANEL = { x: 96, y: 44, w: 288, h: 178 };
 const UPGRADES = [
-  { id: 'turrets', name: 'BUY GUN',       max: 3, cost: l => 30 + 28 * (l - 1), note: 'another turret' },
-  { id: 'rate',    name: 'FIRE RATE +',   max: 6, cost: l => 18 + 12 * l,       note: 'guns shoot faster' },
-  { id: 'dmg',     name: 'DAMAGE +',      max: 6, cost: l => 24 + 16 * l,       note: 'guns hit harder' },
+  { id: 'lady',    name: 'CALL A LADYBUG',  max: 3, cost: l => 30 + 28 * (l - 1), note: 'another escort' },
+  { id: 'speed',   name: 'LADYBUG SPEED +', max: 6, cost: l => 18 + 12 * l,       note: 'they get there sooner' },
+  { id: 'sap',     name: 'STICKY SAP +',    max: 6, cost: l => 24 + 16 * l,       note: 'slows bugs near the nest' },
   { id: 'shell',   name: 'SHELL ARMOR +', max: 6, cost: l => 16 + 11 * l,       note: 'chrysalis hp' },
   { id: 'egg',     name: 'EGG ARMOR +',   max: 6, cost: l => 16 + 11 * l,       note: 'egg hp' },
 ];
-function upLevel(u){ return u.id === 'turrets' ? state.up.turrets : state.up[u.id]; }
+function upLevel(u){ return u.id === 'lady' ? state.up.lady : state.up[u.id]; }
 function upCost(u){ return u.cost(upLevel(u)); }
 function upMaxed(u){ return upLevel(u) >= u.max; }
 
@@ -805,20 +815,20 @@ function hurtPlayer(dmg, fromX){
     p.vy = -110;
     burst(p.x + p.w/2, p.y + 4, '#dd6a55', 8, 80);
     if (p.hp <= 0){
-      /* a larva has no clutch behind it yet - being eaten ends the line */
+      /* a larva has no clutch behind it yet - getting chased off ends the line */
       burst(p.x + p.w/2, p.y + 4, '#5cbb3c', 20, 120);
       if (eggs){ player = null; state.stage = 'rebirth'; state.stageT = 0; }
-      else gameOver('THE CATERPILLAR WAS EATEN', 'It never got to lay a single egg.');
+      else gameOver('CHASED OUT OF THE GARDEN', 'It never got to lay a single egg.');
     }
   }
 }
 
-function spit(b, target){
+/* stink bugs puff clouds that make a butterfly weary - nothing is harmed */
+function stinkPuff(b, target){
   const sx = b.x + b.w/2, sy = b.y + 2;
   const ang = Math.atan2(target.y - sy, target.x - sx) - 0.25;
-  const sp = 130;
-  shots.push({ x: sx, y: sy, vx: Math.cos(ang)*sp, vy: Math.sin(ang)*sp,
-               dmg: 1, poison: true, life: 3, g: 110 });
+  puffs.push({ x: sx, y: sy, vx: Math.cos(ang)*CFG.puffSpeed, vy: Math.sin(ang)*CFG.puffSpeed,
+               dmg: 1, life: 3, g: 110 });
   beep(200, 0.08, 'sawtooth', 0.035);
 }
 
@@ -846,9 +856,20 @@ function bugGoal(b){
 function updateBugs(dt){
   const d = diff();
   for (const b of bugs){
-    if (b.dead) continue;
     b.flash = Math.max(0, b.flash - dt);
     b.anim += dt * 9;
+
+    if (b.flee){
+      /* moved by hand rather than moveEntity, which would pen it inside the world */
+      b.face = b.fleeDir;
+      b.vx = lerp(b.vx, b.fleeDir * b.speed * 2.2, 0.12);
+      if (b.flying) b.vy = lerp(b.vy, -24, 0.08);
+      else b.vy += CFG.grav * dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      if (!b.flying && b.y + b.h >= GROUND_Y){ b.y = GROUND_Y - b.h; b.vy = 0; }
+      continue;
+    }
 
     if (b.stun > 0){
       b.stun -= dt;
@@ -871,16 +892,16 @@ function updateBugs(dt){
     const goal = bugGoal(b);
     b.shootCd -= dt;
 
-    /* spitters keep their distance and lob poison */
+    /* stink bugs keep their distance and puff */
     if (b.type === 'spitter' && !b.rush){
       const st = (state.stage === 'butterfly' && player)
         ? { x: player.x + player.w/2, y: player.y + player.h/2 } : goal;
       if (st){
         const dd = dist(b.x + b.w/2, b.y + b.h/2, st.x, st.y);
         if (dd < 118){
-          if (b.shootCd <= 0){ b.shootCd = rnd(1.5, 2.6) / d; spit(b, st); }
+          if (b.shootCd <= 0){ b.shootCd = rnd(1.5, 2.6) / d; stinkPuff(b, st); }
           b.face = sign(st.x - (b.x + b.w/2)) || b.face;
-          /* hold a firing band - close enough that the guns can answer back */
+          /* hold a puffing band - close enough that a ladybug can reach them */
           if (dd < 70)       b.vx = lerp(b.vx, -b.face * b.speed, 0.12);
           else if (dd > 100) b.vx = lerp(b.vx,  b.face * b.speed, 0.12);
           else               b.vx = lerp(b.vx, 0, 0.18);
@@ -939,7 +960,16 @@ function updateBugs(dt){
       moveEntity(b, dt, false);
     }
 
-    /* chewing on the clutch or the chrysalis */
+    /* sticky sap around the nest bogs an intruder down */
+    if (state.up.sap > 0 && eggs && b.onGround){
+      const reach = 40 + 11 * state.up.sap;
+      if (Math.abs(cx - (eggs.x + 8)) < reach){
+        b.vx *= 1 - Math.min(0.72, 0.13 * state.up.sap);
+        if (Math.random() < dt * 3) burst(cx, GROUND_Y - 1, '#f7c93f', 1, 18, 0.4);
+      }
+    }
+
+    /* nibbling at the clutch or jostling the shell */
     if (goal.ref && (goal.kind === 'eggs' || goal.kind === 'chry')){
       if (aabb(b, goal.ref)){
         goal.ref.hp -= b.chew * d * dt;
@@ -949,49 +979,41 @@ function updateBugs(dt){
       }
     }
   }
-  bugs = bugs.filter(b => !b.dead && b.x > -80 && b.x < WORLD_W + 80);
+  bugs = bugs.filter(b => b.x > -80 && b.x < WORLD_W + 80 &&
+    !(b.flee && (b.x + b.w < cam.x - 24 || b.x > cam.x + VW + 24)));
 }
 
-/* ---------- projectiles, particles -------------------------------------- */
-function updateShots(dt){
-  for (const s of shots){
+/* ---------- stink puffs, particles --------------------------------------- */
+function updatePuffs(dt){
+  for (const s of puffs){
     s.life -= dt;
     if (s.g) s.vy += s.g * dt;
     s.x += s.vx * dt; s.y += s.vy * dt;
-    if (s.life <= 0 || s.y > VH + 10 || s.x < -30 || s.x > WORLD_W + 30){ s.dead = true; continue; }
-    if (s.friendly){
-      for (const b of bugs){
-        if (b.dead) continue;
-        if (s.x > b.x && s.x < b.x + b.w && s.y > b.y && s.y < b.y + b.h){
-          damageBug(b, s.dmg, s.vx * 0.06);
-          s.dead = true; break;
-        }
-      }
-    } else {
-      if (player && player.kind === 'bfly' && s.x > player.x && s.x < player.x + player.w &&
-          s.y > player.y && s.y < player.y + player.h){
-        state.poison = clamp(state.poison + CFG.poisonHit, 0, CFG.poisonMax);
-        player.hurtT = 0.3; state.shake = 3;
-        burst(s.x, s.y, '#7ad13a', 7, 60);
-        beep(150, 0.16, 'sawtooth', 0.05);
-        s.dead = true; continue;
-      }
-      if (player && player.kind === 'cat' && !catHidden() && s.x > player.x && s.x < player.x + player.w &&
-          s.y > player.y && s.y < player.y + player.h){
-        hurtPlayer(1, s.x); s.dead = true; continue;
-      }
-      for (const t of [chry, eggs]){
-        if (!t) continue;
-        if (s.x > t.x && s.x < t.x + t.w && s.y > t.y && s.y < t.y + t.h){
-          t.hp -= s.dmg; t.hurt = 0.15;
-          burst(s.x, s.y, '#7ad13a', 6, 50);
-          s.dead = true; break;
-        }
-      }
-      if (!s.dead && s.y + 2 >= GROUND_Y){ burst(s.x, GROUND_Y, '#7ad13a', 4, 40); s.dead = true; }
+    if (s.life <= 0 || s.y > VH + 10 || s.x < -30 || s.x > WORLD_W + 30){ s.gone = true; continue; }
+
+    if (player && player.kind === 'bfly' && s.x > player.x && s.x < player.x + player.w &&
+        s.y > player.y && s.y < player.y + player.h){
+      state.tired = clamp(state.tired + CFG.tiredHit, 0, CFG.tiredMax);
+      player.hurtT = 0.3; state.shake = 3;
+      burst(s.x, s.y, '#7ad13a', 7, 60);
+      beep(150, 0.16, 'sawtooth', 0.05);
+      s.gone = true; continue;
     }
+    if (player && player.kind === 'cat' && !catHidden() && s.x > player.x && s.x < player.x + player.w &&
+        s.y > player.y && s.y < player.y + player.h){
+      hurtPlayer(1, s.x); s.gone = true; continue;
+    }
+    for (const t of [chry, eggs]){
+      if (!t) continue;
+      if (s.x > t.x && s.x < t.x + t.w && s.y > t.y && s.y < t.y + t.h){
+        t.hp -= s.dmg; t.hurt = 0.15;
+        burst(s.x, s.y, '#7ad13a', 6, 50);
+        s.gone = true; break;
+      }
+    }
+    if (!s.gone && s.y + 2 >= GROUND_Y){ burst(s.x, GROUND_Y, '#7ad13a', 4, 40); s.gone = true; }
   }
-  shots = shots.filter(s => !s.dead);
+  puffs = puffs.filter(s => !s.gone);
 }
 
 function updateParts(dt){
@@ -1005,29 +1027,48 @@ function updateParts(dt){
   floats = floats.filter(f => f.t < 1.1);
 }
 
-function updateTurrets(dt){
-  const rate = CFG.turretRate * (1 + 0.30 * state.up.rate);
-  const dmg  = CFG.turretDmg + state.up.dmg;
-  for (const t of turrets){
-    t.cd -= dt;
-    t.flash = Math.max(0, t.flash - dt);
-    let best = null, bd = 1e9;
-    for (const b of bugs){
-      if (b.dead) continue;
-      const d = dist(t.x + 4, t.y + 3, b.x + b.w/2, b.y + b.h/2);
-      if (d < bd && d < CFG.turretRange){ bd = d; best = b; }
-    }
-    if (best){
-      const ang = Math.atan2(best.y + best.h/2 - (t.y + 3), best.x + best.w/2 - (t.x + 4));
-      t.aim = ang;
-      if (t.cd <= 0){
-        t.cd = 1 / rate; t.flash = 0.09; SFX.shoot();
-        shots.push({ x: t.x + 4 + Math.cos(ang)*6, y: t.y + 3 + Math.sin(ang)*6,
-                     vx: Math.cos(ang)*CFG.pelletSpeed, vy: Math.sin(ang)*CFG.pelletSpeed,
-                     dmg, friendly: true, life: 1.5 });
+/* Ladybugs fly out to meet an intruder, headbutt it until it loses its nerve,
+   then return to their perch. They never hurt anything. */
+function updateLadybugs(dt){
+  const speed = CFG.ladySpeed * (1 + 0.26 * state.up.speed);
+  const guard = eggs ? { x: eggs.x + 8, y: eggs.y + 3 }
+                     : { x: branch.x, y: branch.y + 8 };
+  for (const lb of ladybugs){
+    lb.anim += dt * 14;
+    lb.cool = Math.max(0, lb.cool - dt);
+
+    if (lb.target && (lb.target.flee || bugs.indexOf(lb.target) < 0)) lb.target = null;
+    if (!lb.target && lb.cool <= 0){
+      let best = null, bd = 1e9;
+      for (const b of bugs){
+        if (b.flee) continue;
+        const d = dist(guard.x, guard.y, b.x + b.w/2, b.y + b.h/2);
+        if (d < bd && d < CFG.ladyRange){ bd = d; best = b; }
       }
-    } else {
-      t.aim = lerp(t.aim, -Math.PI/2, 1 - Math.pow(0.02, dt));
+      lb.target = best;
+    }
+
+    const goal = lb.target
+      ? { x: lb.target.x + lb.target.w/2 - lb.w/2, y: lb.target.y + lb.target.h/2 - lb.h/2 }
+      : { x: lb.home.x, y: lb.home.y + Math.sin(lb.anim * 0.3) * 2 };
+    const a = Math.atan2(goal.y - lb.y, goal.x - lb.x);
+    const d = dist(lb.x, lb.y, goal.x, goal.y);
+    const v = lb.target ? speed : Math.min(speed, d * 4);
+    lb.vx = lerp(lb.vx, Math.cos(a) * v, 0.18);
+    lb.vy = lerp(lb.vy, Math.sin(a) * v, 0.18);
+    lb.x += lb.vx * dt; lb.y += lb.vy * dt;
+    if (Math.abs(lb.vx) > 6) lb.face = sign(lb.vx);
+
+    if (lb.target && aabb(lb, lb.target)){
+      const b = lb.target;
+      flusterBug(b, 1, sign(b.x - lb.x) * 60);
+      b.vy = -70;
+      b.stun = Math.max(b.stun, 0.4);
+      burst(b.x + b.w/2, b.y + b.h/2, '#fff3b0', 4, 60, 0.25);
+      SFX.flit();
+      lb.vx = -lb.vx * 1.4; lb.vy = -60;
+      lb.cool = 0.45;
+      lb.target = null;
     }
   }
 }
@@ -1056,7 +1097,7 @@ function handleClicks(){
       continue;
     }
     if (st === 'butterfly' && player){
-      clawAt(Math.atan2(wy - (player.y + player.h/2), wx - (player.x + player.w/2)));
+      gustAt(Math.atan2(wy - (player.y + player.h/2), wx - (player.x + player.w/2)));
       continue;
     }
     if ((st === 'larva' || st === 'nesting') && player){
@@ -1097,7 +1138,7 @@ function buyUpgrade(u){
   const cost = upCost(u);
   if (state.leafPoints < cost){ beep(120, 0.1, 'square', 0.03); say('NOT ENOUGH LEAF POINTS', 1.6); return; }
   state.leafPoints -= cost;
-  if (u.id === 'turrets'){ state.up.turrets++; rebuildTurrets(); }
+  if (u.id === 'lady'){ state.up.lady++; rebuildLadybugs(); }
   else state.up[u.id]++;
   if (u.id === 'shell' && chry){ chry.maxHp += 6; chry.hp += 6; }
   if (u.id === 'egg' && eggs){ eggs.maxHp += 7; eggs.hp += 7; }
@@ -1171,15 +1212,15 @@ function updateCat(dt){
   /* bug contact: stomp beats being bitten, and digging in makes you untouchable */
   if (!catSafe()){
     for (const b of bugs){
-      if (b.dead) continue;
+      if (b.flee) continue;
       if (!aabb(p, b)) continue;
       if (p.vy > 30 && (p.y + p.h) - b.y < 7 && b.stun <= 0){
         b.stun = 1.6; b.vx = p.vx * 0.4; p.vy = -165;
         burst(b.x + b.w/2, b.y, '#c9d2de', 6, 60, 0.35);
         beep(520, 0.07, 'square', 0.05);
-      } else if (p.inv <= 0 && b.stun <= 0 && b.lunge > 0){   // only a real lunge bites
+      } else if (p.inv <= 0 && b.stun <= 0 && b.lunge > 0){   // only a real lunge connects
         hurtPlayer(b.dmg, b.x + b.w/2);
-        b.retreat = 1.6; b.windup = 0; b.lunge = 0;   // it backs off after a bite
+        b.retreat = 1.6; b.windup = 0; b.lunge = 0;   // it backs off after barging through
       }
     }
   }
@@ -1228,7 +1269,7 @@ function updateChrysalis(dt){
     for (const b of bugs) b.rush = true;    // no bug gets to siege from safety forever
   }
   updateBugs(dt);
-  updateTurrets(dt);
+  updateLadybugs(dt);
   if (chry.hurt) chry.hurt = Math.max(0, chry.hurt - dt);
   if (eggs && eggs.hurt) eggs.hurt = Math.max(0, eggs.hurt - dt);
   chry.wobble = Math.sin(state.t * 2.4) * 1.4;
@@ -1245,7 +1286,7 @@ function updateChrysalis(dt){
   if (eggs && eggs.hp <= 0){ gameOver(); return; }
   if (chry.hp <= 0){
     burst(chry.x + 5, chry.y + 7, '#6fe3b4', 24, 120);
-    say('The chrysalis fell - the eggs hatch early!', 3);
+    say('The shell is jostled loose - the eggs hatch early!', 3);
     state.stage = 'rebirth'; state.stageT = 0; chry = null;
     return;
   }
@@ -1278,25 +1319,25 @@ function updateUpgrading(dt){
   if (hitAny(['Enter',' '])) setStage('chrysalis');
 }
 
-function clawAt(ang){
+function gustAt(ang){
   const p = player;
-  if (!p || p.clawCd > 0) return;
-  p.clawCd = CFG.clawCd; p.claw = 0.17; p.clawAng = ang;
+  if (!p || p.gustCd > 0) return;
+  p.gustCd = CFG.gustCd; p.gust = 0.17; p.gustAng = ang;
   p.face = Math.cos(ang) >= 0 ? 1 : -1;
-  SFX.claw();
+  SFX.gust();
   const hx = p.x + p.w/2 + Math.cos(ang) * 14;
   const hy = p.y + p.h/2 + Math.sin(ang) * 14;
-  burst(hx, hy, '#ffd07a', 4, 70, 0.22);
+  burst(hx, hy, '#ffffff', 5, 80, 0.22);
   for (const b of bugs){
-    if (b.dead) continue;
-    if (dist(hx, hy, b.x + b.w/2, b.y + b.h/2) < CFG.clawRange){
-      const finisher = b.stun > 0;               // teeth: a stunned bug gets bitten
-      damageBug(b, finisher ? b.hp + 99 : CFG.clawDmg, Math.cos(ang) * 110);
-      if (b.dead && finisher){
-        burst(b.x + b.w/2, b.y + b.h/2, '#ffffff', 8, 100, 0.4);
-        floatText(b.x + b.w/2, b.y - 4, 'BITE!', '#ffffff');
-        beep(300, 0.16, 'square', 0.06);
-      } else if (!b.dead){ b.stun = 0.75; b.vy = -70; }
+    if (b.flee) continue;
+    if (dist(hx, hy, b.x + b.w/2, b.y + b.h/2) < CFG.gustRange){
+      /* a bug caught off balance is easy to send packing in one gust */
+      const offBalance = b.stun > 0;
+      flusterBug(b, offBalance ? b.calm + 99 : CFG.gustPower, Math.cos(ang) * 130);
+      if (b.flee && offBalance){
+        floatText(b.x + b.w/2, b.y - 4, 'SHOO!', '#ffffff');
+        beep(640, 0.14, 'triangle', 0.05);
+      } else if (!b.flee){ b.stun = 0.75; b.vy = -70; }
     }
   }
 }
@@ -1318,20 +1359,20 @@ function updateButterfly(dt){
   p.y = clamp(p.y + p.vy * dt, 4, GROUND_Y - p.h);
   if (ax) p.face = sign(ax);
   p.anim += dt * (7 + sp * 0.05);
-  p.claw = Math.max(0, p.claw - dt);
-  p.clawCd = Math.max(0, p.clawCd - dt);
+  p.gust = Math.max(0, p.gust - dt);
+  p.gustCd = Math.max(0, p.gustCd - dt);
   p.hurtT = Math.max(0, p.hurtT - dt);
 
-  if (hitAny([' '])) clawAt(p.face > 0 ? 0 : Math.PI);
+  if (hitAny([' '])) gustAt(p.face > 0 ? 0 : Math.PI);
 
   updateBugs(dt);
-  updateTurrets(dt);
+  updateLadybugs(dt);
 
-  /* contact with a bug also costs a little poison - they are filthy */
+  /* wrestling a bug off the nest by hand is tiring work */
   for (const b of bugs){
-    if (b.dead || b.stun > 0) continue;
+    if (b.flee || b.stun > 0) continue;
     if (aabb(p, b)){
-      state.poison = clamp(state.poison + 14 * dt, 0, CFG.poisonMax);
+      state.tired = clamp(state.tired + 14 * dt, 0, CFG.tiredMax);
       p.hurtT = 0.2;
     }
   }
@@ -1348,33 +1389,35 @@ function updateButterfly(dt){
     if (eggs.hurt) eggs.hurt = Math.max(0, eggs.hurt - dt);
     if (eggs.hp <= 0){ gameOver(); return; }
   }
-  if (state.poison < CFG.poisonMax)
-    state.poison = clamp(state.poison - CFG.poisonDecay * dt, 0, CFG.poisonMax);
+  if (state.tired < CFG.tiredMax)
+    state.tired = clamp(state.tired - CFG.tiredDecay * dt, 0, CFG.tiredMax);
   else {
-    state.stage = 'dying'; state.stageT = 0;
-    p.vx = rnd(-40, 40); p.vy = -60; p.spin = 0;
-    SFX.die();
-    say('The poison wins... but the eggs remain.', 3);
+    state.stage = 'resting'; state.stageT = 0;
+    p.vx = rnd(-30, 30); p.vy = -40; p.spin = 0;
+    SFX.settle();
+    say('Too weary to fly on... but the eggs are stirring.', 3);
   }
 }
 
-function updateDying(dt){
+function updateResting(dt){
   const p = player;
   if (p){
-    p.vy += 240 * dt;
+    /* it glides down and settles on the soil, wings slowing */
+    p.vy += 150 * dt;
+    p.vx *= 1 - 1.4 * dt;
     p.x += p.vx * dt; p.y += p.vy * dt;
-    p.spin = (p.spin || 0) + dt * 7;
-    if (p.y + p.h > GROUND_Y){ p.y = GROUND_Y - p.h; p.vy *= -0.3; p.vx *= 0.6; }
-    if (Math.random() < dt * 8) burst(p.x + p.w/2, p.y + 6, '#7ad13a', 1, 30, 0.5);
+    p.spin = lerp(p.spin || 0, 0.35, 2 * dt);
+    if (p.y + p.h > GROUND_Y){ p.y = GROUND_Y - p.h; p.vy = 0; p.vx *= 0.5; }
+    if (Math.random() < dt * 5) burst(p.x + p.w/2, p.y + 6, '#c294ee', 1, 20, 0.6);
   }
   updateBugs(dt);
-  updateTurrets(dt);
+  updateLadybugs(dt);
   if (state.stageT > 2.0){ player = null; state.stage = 'rebirth'; state.stageT = 0; }
 }
 
 function updateRebirth(dt){
   updateBugs(dt);
-  updateTurrets(dt);
+  updateLadybugs(dt);
   if (eggs){
     eggs.glow = state.stageT;
     if (Math.random() < dt * 12) burst(eggs.x + rnd(0,16), eggs.y + 3, '#fffdf2', 1, 40, 0.5);
@@ -1463,6 +1506,22 @@ function drawGround(){
   }
 }
 
+function drawSap(){
+  if (!state.up.sap || !eggs) return;
+  const reach = 40 + 11 * state.up.sap;
+  const x0 = eggs.x + 8 - reach - cam.x;
+  for (let i = 0; i < reach * 2; i++){
+    const t = Math.abs(i - reach) / reach;
+    const h = Math.round(3 * (1 - t * t));
+    if (h <= 0) continue;
+    px(x0 + i, GROUND_Y - h + 1, 1, h, i % 7 === 0 ? '#ffd07a' : '#d9a23c');
+  }
+  for (let i = 0; i < 10; i++){
+    const gx = x0 + ((i * 37) % (reach * 2));
+    px(gx, GROUND_Y - 2 - (i % 2), 1, 1, '#fff3b0');
+  }
+}
+
 function drawPlants(){
   for (const s of stems){
     const sway = Math.sin(state.t * 1.2 + s.sway) * 1.2;
@@ -1538,15 +1597,13 @@ function drawChrysalis(){
   }
 }
 
-function drawTurrets(){
-  for (const t of turrets){
-    const bx = t.x + 4 - cam.x, by = t.y + 3;
-    for (let i = 3; i < 9; i++)
-      px(bx + Math.cos(t.aim) * i, by + Math.sin(t.aim) * i, 1, 1, '#c9d2de');
-    blit(SPR.turret, t.x - cam.x, t.y);
-    if (t.flash > 0){
-      px(bx + Math.cos(t.aim) * 9 - 1, by + Math.sin(t.aim) * 9 - 1, 3, 3, '#fff3b0');
-    }
+function drawLadybugs(){
+  for (const lb of ladybugs){
+    /* a blur of wings either side of the shell */
+    const w = Math.sin(lb.anim) > 0 ? 2 : 1;
+    px(lb.x - cam.x - 2, lb.y + 1, 2, w, 'rgba(255,255,255,.65)');
+    px(lb.x - cam.x + lb.w, lb.y + 1, 2, w, 'rgba(255,255,255,.65)');
+    blit(SPR.lady[lb.face > 0 ? 0 : 1], lb.x - cam.x, lb.y);
   }
 }
 
@@ -1564,20 +1621,15 @@ function drawBugs(){
       px(b.x + b.w/2 - cam.x + Math.cos(a)*4, b.y - 5 + Math.sin(a)*1.5, 1, 1, '#fff3b0');
       px(b.x + b.w/2 - cam.x - Math.cos(a)*4, b.y - 5 - Math.sin(a)*1.5, 1, 1, '#fff3b0');
     }
-    if (b.maxHp > 2 && b.hp < b.maxHp)
-      bar(b.x - cam.x, b.y - 4, b.w, 2, b.hp / b.maxHp, '#dd6a55', '#3a2412');
+    if (!b.flee && b.maxCalm > 2 && b.calm < b.maxCalm)
+      bar(b.x - cam.x, b.y - 4, b.w, 2, b.calm / b.maxCalm, '#f7c93f', '#3a2412');
   }
 }
 
 function drawShots(){
-  for (const s of shots){
-    if (s.friendly){
-      px(s.x - cam.x - 1, s.y - 1, 2, 2, '#fff3b0');
-      px(s.x - cam.x - 2, s.y, 1, 1, 'rgba(255,243,176,.5)');
-    } else {
-      px(s.x - cam.x - 1, s.y - 1, 3, 3, '#7ad13a');
-      px(s.x - cam.x, s.y, 1, 1, '#c4f27a');
-    }
+  for (const s of puffs){
+    px(s.x - cam.x - 1, s.y - 1, 3, 3, '#7ad13a');
+    px(s.x - cam.x, s.y, 1, 1, '#c4f27a');
   }
 }
 
@@ -1620,7 +1672,7 @@ function drawPlayer(){
     const frame = Math.floor(p.anim) % 2;
     let img = SPR.bfly[frame][p.face > 0 ? 0 : 1];
     if (p.hurtT > 0) img = whiteOf(img);
-    if (state.stage === 'dying'){
+    if (state.stage === 'resting'){
       ctx.save();
       ctx.translate(Math.round(p.x + p.w/2 - cam.x), Math.round(p.y + p.h/2));
       ctx.rotate(p.spin || 0);
@@ -1629,8 +1681,8 @@ function drawPlayer(){
     } else {
       blit(img, p.x - cam.x, p.y);
     }
-    if (p.claw > 0){
-      const a0 = p.clawAng - 0.7, a1 = p.clawAng + 0.7;
+    if (p.gust > 0){
+      const a0 = p.gustAng - 0.7, a1 = p.gustAng + 0.7;
       const cx2 = p.x + p.w/2 - cam.x, cy2 = p.y + p.h/2;
       for (let i = 0; i <= 8; i++){
         const a = lerp(a0, a1, i/8);
@@ -1652,7 +1704,7 @@ function drawHud(){
   shadowText('GEN ' + state.gen, 6, 5, '#ffffff');
   shadowText('LEAF ' + Math.floor(state.leafPoints), 6, 15, '#f7c93f');
   shadowText('BEST GEN ' + state.best, VW - 6, 5, '#c9d2de', 'right');
-  shadowText('BUGS ' + state.bugsKilled, VW - 6, 15, '#c9d2de', 'right');
+  shadowText('SHOOED ' + state.bugsShooed, VW - 6, 15, '#c9d2de', 'right');
 
   const st = state.stage;
   if ((st === 'larva' || st === 'nesting') && player){
@@ -1671,8 +1723,8 @@ function drawHud(){
     if (chry) bar(VW/2 - 42, 16, 84, 5, chry.hp / chry.maxHp, '#6fe3b4', '#1d3a30', 'SHELL');
     if (eggs) bar(VW/2 - 42, 25, 84, 5, eggs.hp / eggs.maxHp, '#efe6cf', '#5b2f18', 'EGGS');
   }
-  if (st === 'butterfly' || st === 'dying'){
-    bar(VW/2 - 52, 6, 104, 6, state.poison / CFG.poisonMax, '#7ad13a', '#22303a', 'POISON');
+  if (st === 'butterfly' || st === 'resting'){
+    bar(VW/2 - 52, 6, 104, 6, state.tired / CFG.tiredMax, '#c294ee', '#22303a', 'WEARY');
     if (eggs) bar(VW/2 - 52, 17, 104, 5, eggs.hp / eggs.maxHp, '#efe6cf', '#5b2f18', 'EGGS');
   }
 
@@ -1700,7 +1752,7 @@ function drawPanel(){
     px(r.x, r.y, r.w, r.h, hov && afford ? 'rgba(111,227,180,.30)' : 'rgba(255,255,255,.07)');
     ctx.strokeStyle = afford ? '#6fe3b4' : 'rgba(255,255,255,.18)';
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
-    const lv = upLevel(u) - (u.id === 'turrets' ? 1 : 0);
+    const lv = upLevel(u) - (u.id === 'lady' ? 1 : 0);
     shadowText((i+1) + '. ' + u.name + '  Lv' + lv, r.x + 6, r.y + 5, afford ? '#ffffff' : '#8d97a3');
     shadowText(maxed ? 'MAX' : cost + ' lf', r.x + r.w - 6, r.y + 5, maxed ? '#8d97a3' : (afford ? '#f7c93f' : '#8d97a3'), 'right');
   });
@@ -1720,14 +1772,14 @@ function drawOverlays(){
     shadowText('CATERPILLAR  LIFE', VW/2, 68, '#9ee86a', 'center');
     ctx.font = '8px "Courier New",Courier,monospace';
     const lines = [
-      'Eat the garden. Hide your eggs. Pupate behind guns.',
-      'Fly as a butterfly with claws and teeth.',
-      'Poison will take you - the eggs carry you on.',
+      'Eat the garden. Hide your eggs. Pupate under a ladybug guard.',
+      'Fly as a butterfly and shoo the bugs off your nest.',
+      'Nobody gets hurt here - bugs just lose their nerve.',
       '',
       'MOVE  arrows / A D      JUMP  W / up / space',
       'HIDE  S / down (burrow, you are safe but airless)',
       'EAT   hold E  -  or CLICK a leaf to bite it faster',
-      'FLY   arrows      CLAW  space or click a bug',
+      'FLY   arrows      FLAP  space or click a bug',
       '',
       'CLICK ANYWHERE TO BEGIN',
     ];
@@ -1739,10 +1791,10 @@ function drawOverlays(){
   }
   if (state.stage === 'gameover'){
     px(0, 0, VW, VH, 'rgba(30,8,8,.72)');
-    shadowText(state.overTitle || 'THE CLUTCH IS GONE', VW/2, 74, '#dd6a55', 'center');
-    shadowText(state.overSub || 'Nothing was left to hatch.', VW/2, 90, '#dfe7ee', 'center');
+    shadowText(state.overTitle || 'THE NEST IS EMPTY', VW/2, 74, '#dd6a55', 'center');
+    shadowText(state.overSub || 'The bugs carried off the last egg.', VW/2, 90, '#dfe7ee', 'center');
     shadowText('GENERATIONS SURVIVED : ' + (state.gen - 1), VW/2, 112, '#ffffff', 'center');
-    shadowText('BUGS KILLED          : ' + state.bugsKilled, VW/2, 124, '#ffffff', 'center');
+    shadowText('BUGS SHOOED          : ' + state.bugsShooed, VW/2, 124, '#ffffff', 'center');
     shadowText('LEAVES EATEN         : ' + state.leavesEaten, VW/2, 136, '#ffffff', 'center');
     shadowText('BEST : ' + state.best, VW/2, 154, '#f7c93f', 'center');
     const r = { x: VW/2 - 60, y: 186, w: 120, h: 18 };
@@ -1768,9 +1820,10 @@ function draw(){
   drawPlants();
   drawLog();
   drawGround();
+  drawSap();
   drawEggs();
   drawChrysalis();
-  drawTurrets();
+  drawLadybugs();
   drawBugs();
   drawPlayer();
   drawShots();
@@ -1824,7 +1877,7 @@ function update(dt){
   if (hit('p') && state.stage !== 'title' && state.stage !== 'gameover') state.paused = !state.paused;
   if (hit('r') && state.stage !== 'title') resetRun();
   if (DEBUG){
-    if (hit('k')) bugs.forEach(b => damageBug(b, 999, 0));
+    if (hit('k')) bugs.forEach(b => flusterBug(b, 999, 0));
     if (hit('[') || hit(']')){
       let i = DBG_ORDER.indexOf(['upgrading','chrysalis'].indexOf(state.stage) >= 0 ? 'chrysalis' : state.stage);
       if (i < 0) i = 0;
@@ -1833,8 +1886,8 @@ function update(dt){
     }
     if (hit('g')){
       if (state.stage === 'larva') state.fullness = 1;
-      else if (state.stage === 'butterfly') state.poison = CFG.poisonMax;
-      else if (state.stage === 'chrysalis') bugs.forEach(b => damageBug(b, 999, 0));
+      else if (state.stage === 'butterfly') state.tired = CFG.tiredMax;
+      else if (state.stage === 'chrysalis') bugs.forEach(b => flusterBug(b, 999, 0));
     }
     if (hit('h') && eggs) eggs.hp = 0;
   }
@@ -1850,10 +1903,10 @@ function update(dt){
       case 'chrysalis':  updateChrysalis(dt); break;
       case 'upgrading':  updateUpgrading(dt); break;
       case 'butterfly':  updateButterfly(dt); break;
-      case 'dying':      updateDying(dt); break;
+      case 'resting':    updateResting(dt); break;
       case 'rebirth':    updateRebirth(dt); break;
     }
-    if (state.stage !== 'upgrading'){ updateShots(dt); updateParts(dt); }
+    if (state.stage !== 'upgrading'){ updatePuffs(dt); updateParts(dt); }
     updateCamera(dt);
   }
   tapped.clear();
@@ -1873,7 +1926,8 @@ function frame(now){
 window.CL = { state, CFG, debugGoto,
               get player(){ return player; }, get eggs(){ return eggs; },
               get chry(){ return chry; }, get bugs(){ return bugs; },
-              get camX(){ return cam.x; }, get leaves(){ return leaves; } };
+              get camX(){ return cam.x; }, get leaves(){ return leaves; },
+              get ladybugs(){ return ladybugs; }, flusterBug };
 
 buildGarden();
 cam.x = clamp(branch.x - VW/2, 0, WORLD_W - VW);
