@@ -120,7 +120,8 @@ frames.
 | Pitch | `↑` / `W` push, `↓` / `S` pull |
 | Roll | `←` `→` or `A` `D` |
 | Rudder | `Q` `E` |
-| Throttle | `SHIFT` / `CTRL`, or the mouse wheel |
+| Throttle | `SHIFT` / `CTRL`, the mouse wheel, or drag the slider at the right edge |
+| Auto-throttle | `T`, or the **A/T** switch above the throttle |
 | Camera | `C` — chase, flight deck, cabin |
 | Help / pause / sound / restart | `H` / `P` / `M` / `R` |
 
@@ -129,7 +130,8 @@ You can also hold the left mouse button anywhere and fly it like a stick.
 ## Assist
 
 Pick a level on the title screen. **Rookie** gives you a flight director and an
-auto-throttle, and calms the air down. **Pilot** keeps the director only. **Astronaut** is
+auto-throttle, and calms the air down — move the throttle yourself and the auto-throttle
+drops out, as thrust levers do; **A/T** (or `T`) hands it back. **Pilot** keeps the director only. **Astronaut** is
 you, the ball, and real turbulence.
 
 ## Notes on the flight model

@@ -834,7 +834,7 @@ const MESH = {
 const AP = {
   pos:v3(0, CFG.entryAlt, 0), vel:v3(0,0,-250), q:qid(),
   w:v3(),                       // body rates: x pitch-up, y yaw-left, z roll-left
-  throttle:0.72, fuel:AC.fuel,
+  throttle:0.72, fuel:AC.fuel, autoThr:true,
   aSpec:v3(), gBody:v3(0,1,0), gMag:1, nz:1,
   alpha:0, beta:0, mach:0, ias:0, tas:0, qbar:0, rho:RHO0,
   alphaTrim:0, alphaCmd:0, gammaDot:0,
@@ -1128,6 +1128,7 @@ function resetRun(){
   AP.vel = v3(0, 0, -252);
   AP.q = qid(); AP.w = v3();
   AP.throttle = 0.74; AP.fuel = AC.fuel; AP.broken = false; AP.over = 0;
+  AP.autoThr = ASSIST[game.assist].autoThrottle;
   AP.stalled = false; AP.buffet = 0;
   CTL.pitch = CTL.roll = CTL.yaw = 0;
   world.trail.length = 0;
@@ -1248,10 +1249,11 @@ function missionStep(dt){
     }
   }
 
-  /* auto-throttle, when the assist level offers it. In the float it matches
-     thrust to drag so the fore-and-aft g goes away too; the rest of the time
-     it just keeps the energy where the next parabola needs it. */
-  if(ASSIST[game.assist].autoThrottle){
+  /* auto-throttle, while it is engaged. In the float it matches thrust to
+     drag so the fore-and-aft g goes away too; the rest of the time it just
+     keeps the energy where the next parabola needs it. Touch the throttle
+     yourself and it hands the levers straight back to you. */
+  if(ASSIST[game.assist].autoThrottle && AP.autoThr){
     const air = atmos(AP.pos.y);
     const thrMax = AC.thrustSL*Math.pow(air.rho/RHO0, 0.75);
     let want;
@@ -1264,6 +1266,24 @@ function missionStep(dt){
     else want = AP.ias < CFG.entryIAS ? 1.0 : (AP.ias > AC.iasMax*0.88 ? 0.30 : 0.72);
     AP.throttle = approach(AP.throttle, want, 1.3, dt);
   }
+}
+
+/* moving the throttle by hand disconnects the auto-throttle, the way it does
+   in anything with thrust levers */
+function throttleByHand(){
+  if(!AP.autoThr) return;
+  AP.autoThr = false;
+  msg('auto-throttle off — you have the levers', 'info');
+  blip(520, 0.07, 'square', 0.08);
+}
+function toggleAutoThrottle(){
+  if(!ASSIST[game.assist].autoThrottle){
+    msg('no auto-throttle at this assist level', 'info');
+    return;
+  }
+  AP.autoThr = !AP.autoThr;
+  msg(AP.autoThr ? 'auto-throttle engaged' : 'auto-throttle off — you have the levers', 'info');
+  blip(AP.autoThr ? 780 : 520, 0.08, 'square', 0.09);
 }
 
 /* where the flight director would like the stick to be, right now */
@@ -1430,6 +1450,7 @@ function layout(){
   UI.thr.h = clamp(Math.min(h*0.40, 220), 120, 240);
   UI.thr.x = R - UI.thr.w;
   UI.thr.y = B - UI.thr.h - 14;
+  UI.atBtn = { id:'at', x:UI.thr.x, y:UI.thr.y - 24, w:UI.thr.w, h:20 };
 
   const bs = clamp(44*s, 34, 48), gap = 7;
   UI.btns = [];
@@ -1487,6 +1508,7 @@ function tapKey(k, e){
   if(k === 'h'){ game.help = !game.help; }
   if(k === 'r'){ resetRun(); game.state = 'fly'; game.paused = false; }
   if(k === 'x'){ CTL.pitch = 0; CTL.roll = 0; }
+  if(k === 't'){ toggleAutoThrottle(); }
   if(DEBUG && k === 'g'){ AP.pos.y = CFG.entryAlt; AP.vel = v3(0,0,-252); AP.q = qid(); AP.w = v3(); }
 }
 addEventListener('keydown', e => onKey(e, true));
@@ -1510,11 +1532,12 @@ function keyboardStep(dt){
   CTL.yaw = KEYCTL.yaw;
   if(!UI.thr.active){
     const t = (keys['Shift'] ? 1 : 0) - (keys['Control'] ? 1 : 0);
-    if(t) AP.throttle = clamp(AP.throttle + t*0.55*dt, 0, 1);
+    if(t){ throttleByHand(); AP.throttle = clamp(AP.throttle + t*0.55*dt, 0, 1); }
   }
 }
 addEventListener('wheel', e => {
   if(game.state !== 'fly') return;
+  throttleByHand();
   AP.throttle = clamp(AP.throttle - sign(e.deltaY)*0.05, 0, 1);
 }, { passive:true });
 
@@ -1549,15 +1572,24 @@ function onDown(e){
   if(game.help){ game.help = false; return; }
   if(game.paused){ game.paused = false; return; }
 
+  const hasAT = ASSIST[game.assist].autoThrottle;
+  if(hasAT && hit(UI.atBtn, x, y)){ toggleAutoThrottle(); return; }
   if(UI.showTouch){
     if(hit(UI.rud.l, x, y)){ pointers.set(id, { role:'rudL' }); UI.rud.dir = -1; return; }
     if(hit(UI.rud.r, x, y)){ pointers.set(id, { role:'rudR' }); UI.rud.dir =  1; return; }
-    const t = UI.thr;
-    if(x > t.x - 30 && x < t.x + t.w + 24 && y > t.y - 24 && y < t.y + t.h + 24){
+  }
+  /* the throttle takes a mouse as happily as a thumb */
+  {
+    const t = UI.thr, pad = UI.showTouch ? 26 : 10;
+    const top = hasAT ? UI.atBtn.y + UI.atBtn.h + 2 : t.y - pad;
+    if(x > t.x - pad && x < t.x + t.w + pad && y > top && y < t.y + t.h + pad){
+      throttleByHand();
       pointers.set(id, { role:'thr' }); t.active = true; t.id = id;
       AP.throttle = clamp(1 - (y - t.y)/t.h, 0, 1);
       return;
     }
+  }
+  if(UI.showTouch){
     if(x < UI.w*0.55){
       const s = UI.stick;
       s.active = true; s.id = id;
@@ -1587,6 +1619,7 @@ function onMove(e){
     s.dx = dx; s.dy = dy;
     CTL.roll = dx; CTL.pitch = dy;      // screen-down on the stick is nose-down
   } else if(p.role === 'thr'){
+    throttleByHand();
     AP.throttle = clamp(1 - (y - UI.thr.y)/UI.thr.h, 0, 1);
   }
 }
@@ -2243,6 +2276,9 @@ function drawControls(){
     if(b.id === 'sound' && game.muted) line(b.x+10, b.y+10, b.x+b.w-10, b.y+b.h-10, C.bad, 2);
     if(b.id === 'view') txt(['CHASE','DECK','CABIN'][game.view], b.x+b.w/2, b.y+b.h-4, C.dim, 8, 'center');
   }
+  drawThrottle();
+  if(UI.showTouch && UI.rud.l){ drawButton(UI.rud.l, UI.rud.dir<0); drawButton(UI.rud.r, UI.rud.dir>0); }
+
   /* on a keyboard the stick is only drawn while you are dragging it */
   if(!UI.showTouch && !mouseFly.on) return;
 
@@ -2271,19 +2307,27 @@ function drawControls(){
   ctx.restore();
   txt('PULL', s.cx, s.cy + s.r - 8, C.soft, 9, 'center');
   txt('PUSH', s.cx, s.cy - s.r + 14, C.soft, 9, 'center');
+}
 
-  /* throttle */
-  const t = UI.thr;
+/* the thrust levers, and the switch that says who is holding them */
+function drawThrottle(){
+  const t = UI.thr, auto = ASSIST[game.assist].autoThrottle && AP.autoThr;
   panel(t.x, t.y, t.w, t.h, 10, 'rgba(5,11,14,0.55)');
   const fh = t.h*clamp(AP.throttle,0,1);
   rrect(t.x+3, t.y + t.h - fh + 1, t.w-6, Math.max(2, fh-4), 8);
-  ctx.fillStyle = 'rgba(121,247,180,0.28)'; ctx.fill();
+  ctx.fillStyle = auto ? 'rgba(121,247,180,0.18)' : 'rgba(121,247,180,0.28)';
+  ctx.fill();
   const ky = t.y + t.h - fh;
-  line(t.x+2, ky, t.x+t.w-2, ky, C.hud, 2.5);
-  txt('THR', t.x+t.w/2, t.y-6, C.dim, 10, 'center');
+  line(t.x+2, ky, t.x+t.w-2, ky, auto ? C.dim : C.hud, 2.5);
   txt((AP.throttle*100).toFixed(0), t.x+t.w/2, t.y+t.h+13, C.hud, 12, 'center', 'alphabetic', 'bold');
 
-  if(UI.rud.l){ drawButton(UI.rud.l, UI.rud.dir<0); drawButton(UI.rud.r, UI.rud.dir>0); }
+  if(ASSIST[game.assist].autoThrottle){
+    const a = UI.atBtn;
+    panel(a.x, a.y, a.w, a.h, 6, AP.autoThr ? 'rgba(18,64,46,0.85)' : C.ink);
+    txt('A/T', a.x+a.w/2, a.y+a.h*0.72, AP.autoThr ? C.good : C.dim, 11, 'center', 'alphabetic', 'bold');
+  } else {
+    txt('THR', t.x+t.w/2, t.y-6, C.dim, 10, 'center');
+  }
 }
 
 /* ---------- picture in picture, and the cabin's mood --------------------- */
@@ -2399,9 +2443,12 @@ function drawMenu(){
     y += clamp(20*s, 15, 22);
   }
   const ctrl = IS_TOUCH
-    ? ['left thumb — stick: drag DOWN to pull the nose up', 'right edge — throttle', 'buttons — camera, pause, sound, help']
+    ? ['left thumb — stick: drag DOWN to pull the nose up',
+       'right edge — throttle, with the A/T switch above it',
+       'buttons — camera, pause, sound, help']
     : ['↑ / W push   ↓ / S pull   ← → / A D roll   Q E rudder',
-       'SHIFT / CTRL throttle   ·   C camera   P pause   M sound   H help',
+       'SHIFT / CTRL or the wheel throttle   ·   T auto-throttle   ·   C camera',
+       'P pause   ·   M sound   ·   H help   ·   R restart',
        'or hold the left mouse button and fly it like a stick'];
   for(const l of ctrl){ txt(l, cx, y, C.dim, clamp(11*s, 9, 12), 'center'); y += clamp(16*s, 13, 18); }
 }
@@ -2444,7 +2491,7 @@ function drawHelp(){
     ['1  SET UP', '24,000 ft, 300 kt indicated, wings level.'],
     ['2  PULL',   'Ease back until the ball sits on the 1.8 g mark. Hold it to 45° nose high.'],
     ['3  PUSH',   'Over the top, push forward and keep pushing — the ball belongs in the ring.'],
-    ['4  THROTTLE','Drag still pushes you back. Come back to near idle so the ball centres sideways too.'],
+    ['4  THROTTLE','Drag still pushes you back. Come back to near idle so the ball centres sideways too. Touching the throttle takes it off the auto-throttle; the A/T switch beside it (or T) hands it back.'],
     ['5  RECOVER','By 30° nose down, pull out at about 1.8 g. Do not exceed 2.6 g or the speed limit.'],
   ];
   for(const [k, v] of steps){
